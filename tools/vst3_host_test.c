@@ -12,7 +12,12 @@
  * aspect-keeping constraint (the window itself is not opened). --shots <dir> renders every skin page as the editor would
  * draw it now (after the audio and MIDI tests, so readouts show something) to <dir>/page<N>.png. Exit status 0 = all passed. */
 #include "vst3_abi.h"
+#ifdef _WIN32
+#include <windows.h>
+#define dlsym(h, n) ((void *)GetProcAddress((HMODULE)(h), (n)))
+#else
 #include <dlfcn.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -528,12 +533,19 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--passthrough")) passthrough = 1;
         else if (!strcmp(argv[i], "--shots") && i + 1 < argc) shots = argv[++i];
     }
+#ifdef _WIN32   /* Windows bundles export InitDll/ExitDll instead of ModuleEntry/ModuleExit */
+    void *h = (void *)LoadLibraryA(argv[1]);
+    if (!h) { printf("FAIL: LoadLibrary %s: error %lu\n", argv[1], GetLastError()); return 1; }
+    int (*entry)(void *) = (int (*)(void *))dlsym(h, "InitDll");   /* takes no argument; ignores the one passed */
+    int (*leave)(void) = (int (*)(void))dlsym(h, "ExitDll");
+#else
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { printf("FAIL: dlopen: %s\n", dlerror()); return 1; }
     int (*entry)(void *) = (int (*)(void *))dlsym(h, "ModuleEntry");
     int (*leave)(void) = (int (*)(void))dlsym(h, "ModuleExit");
+#endif
     void *(*get_factory)(void) = (void *(*)(void))dlsym(h, "GetPluginFactory");
-    if (!entry || !leave || !get_factory) { printf("FAIL: missing ModuleEntry/ModuleExit/GetPluginFactory\n"); return 1; }
+    if (!entry || !leave || !get_factory) { printf("FAIL: missing entry/exit/GetPluginFactory\n"); return 1; }
     CHECK(entry(h), "ModuleEntry");
     g_factory = get_factory();
     const FactoryVtbl *f = VT(FactoryVtbl, g_factory);

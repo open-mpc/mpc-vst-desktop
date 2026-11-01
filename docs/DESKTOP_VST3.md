@@ -26,6 +26,25 @@ their own hand-written wrapper, or no `params`/`build.sources` in `vst.json`, ar
 
 ![Chordsmith in Reaper: the PLAY page](images/desktop-vst3/reaper-chordsmith.png)
 
+## Windows (prepared, 2026-10-31, offline under Wine only)
+
+`VST3_TARGET=windows tools/build_vst3.sh <port>/vst.json` cross-builds a 64-bit Windows bundle,
+`<name>.vst3/Contents/x86_64-win/<name>.vst3`, with mingw-w64 (`x86_64-w64-mingw32-gcc`). The DLL is static (engine, winpthreads
+and the C++ runtime), exports `GetPluginFactory`, `InitDll` and `ExitDll`, and `plugin_dir.h` finds its folder with
+`GetModuleFileName`. `VST3_TARGET=windows tools/test_vst3.sh <port>/vst.json` builds the same and runs `vst3_host_test.c`
+(built for Windows) under Wine: factory, parameters, audio at three rates, state.
+
+What is not done:
+
+- **Not run on a real Windows host or DAW.** Wine passes the test with `poc/uiprobe`; nobody has loaded a bundle in a
+  Windows DAW yet. Copy the bundle to `C:\Program Files\Common Files\VST3`. `--install` is Linux-only.
+- **No editor.** `vst3_editor.c` is X11 + cairo + FreeType; a DAW shows its generic parameter view. A Windows editor needs a
+  `"HWND"` platform type view and a window/paint layer in place of the X11 one (cairo's win32 surface, or GDI), and cairo and
+  FreeType built for mingw (not packaged here). The skin loading and drawing code is platform-neutral and can stay.
+- **Engines are POSIX code.** The wrapper builds, but an engine that includes `dlfcn.h`, `unistd.h`, ALSA or similar
+  (the Maschine engine does) needs those parts guarded for `_WIN32` first. Self-contained engines such as the probes build as is.
+- No installer or catalog entry for Windows binaries.
+
 ## How it maps onto VST3
 
 `wrapper/vst3_wrap.c` drives the same `mpc_engine_t` as `vst2_wrap.c`, from the same generated `params.h`. The VST3 ABI is

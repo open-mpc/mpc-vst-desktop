@@ -1107,12 +1107,23 @@ static void init_tables(void) {
     make_cid();
 }
 
-__attribute__((visibility("default"))) void *GetPluginFactory(void) {
+#ifdef _WIN32
+#define VST3_EXPORT __declspec(dllexport)
+#else
+#define VST3_EXPORT __attribute__((visibility("default")))
+#endif
+VST3_EXPORT void *GetPluginFactory(void) {
     init_tables();
     return (void *)&factory;
 }
-__attribute__((visibility("default"))) int ModuleEntry(void *handle) { (void)handle; init_tables(); return 1; }
-__attribute__((visibility("default"))) int ModuleExit(void) { return 1; }
+#ifdef _WIN32
+/* Windows hosts call InitDll/ExitDll where Linux ones call ModuleEntry/ModuleExit. */
+VST3_EXPORT int InitDll(void) { init_tables(); return 1; }
+VST3_EXPORT int ExitDll(void) { return 1; }
+#else
+VST3_EXPORT int ModuleEntry(void *handle) { (void)handle; init_tables(); return 1; }
+VST3_EXPORT int ModuleExit(void) { return 1; }
+#endif
 
 #ifdef VST3_EDITOR
 #include "vst3_editor.c"
