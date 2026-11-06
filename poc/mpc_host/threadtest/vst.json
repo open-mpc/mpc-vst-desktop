@@ -1,0 +1,9 @@
+{
+  "name": "MPC Host Thread Test",
+  "vendor": "open-mpc",
+  "uid": "HThT",
+  "version": 1000,
+  "so": "threadtest.so",
+  "params": "params.json",
+  "build": {"root": ".", "sources": ["engine.c"], "cflags": [], "libs": ["-lm"]}
+}

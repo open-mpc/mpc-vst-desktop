@@ -178,9 +178,9 @@ restores, and compares each with its own saved value):
 
 | Result | Plugins |
 |---|---|
-| Runs; all checked parameters restored from the chunk | Dexed DX7 (2289 B), jn106, profit5, trcw78 (2 files), model303 and acid303, morpho_pe, clementine and clementine_xt, maze combo and sequencer, the 8 airwin2rack plugins, monomodule_fx. OTT and both Reverbicon builds have settable parameters and no chunk |
-| Runs, but not meaningful | machinedrum_one and MM-303 start a worker thread (`pthread_create` is stubbed in `MPC_HOST_LAX` mode) and restore 0/8; machinedrum tap and tapfx have no settable parameter |
-| Stops | jv880, lucky dip, model72: `pthread_create`. cratedigger (2 files): `VSTPluginMain` returns no `AEffect`. rhythmbank: calls `abort` (cause not looked at) |
+| Runs; all checked parameters restored from the chunk | Dexed DX7 (2289 B), jn106, profit5, trcw78 (2 files), model303 and acid303, morpho_pe, clementine and clementine_xt, maze combo and sequencer, the 8 airwin2rack plugins, and, with threads (below), lucky dip (374 B), model72 (869 B), monomodule_fx (313 B). OTT, both Reverbicon builds and jv880 have settable parameters and no chunk |
+| Runs; restore not confirmed | machinedrum_one restores 0/8 from a 512 B chunk, also with two audio blocks processed after the restore; not yet known if the port applies state some other way. machinedrum tap and tapfx have no settable parameter |
+| Stops | MM-303: `getcwd`, sockets (device IPC). cratedigger (2 files): `VSTPluginMain` returns no `AEffect`; it imports `posix_spawn` and threads, so it probably starts helper processes. rhythmbank: imports the ALSA sequencer (`snd_seq_open`); the `abort` follows a failed open |
 
 A first run of this table showed clementine and morpho_pe restoring every parameter to 1.000. That was the host: `sscanf` ignored field
 widths, so a hex chunk read with `%2x` parsed as one number. Widths are implemented now and both restore correctly. The lesson for the next
@@ -188,11 +188,31 @@ failure: a state bug that hits every parameter is probably a libc thunk, not the
 
 Dexed's C++ exceptions are not exercised yet: the unwinder needs `dl_iterate_phdr`, which calls back into guest code.
 
+## Threads (2026-11-06, offline)
+
+Guest threads are cooperative on the one JIT. A switch happens inside a thunk by swapping the register file, so a thread that blocks
+resumes at the `bx lr` after its own `svc`; no nested `Run()` is needed. Rules:
+- `pthread_create` runs the new thread first, until it blocks or exits; the parent then gets 0 back. Each thread has a 512 KB stack.
+- Blocking calls are `pthread_mutex_lock` on a held mutex (glibc armhf layout: count +4, owner +8, kind +12; recursive kind 1),
+  `pthread_cond_wait`/`timedwait`/`clockwait`, `pthread_join`, `usleep`/`nanosleep`/`clock_nanosleep`/`sleep`, and `poll` with a timeout.
+  `sched_yield` switches to the next ready thread.
+- Threads run only inside a host call. When it returns, `drain()` runs each ready worker until it blocks again, with the host call's
+  registers put back afterwards. A sleeping worker wakes on the next host call. While the main thread sleeps or waits inside a call, the
+  clock advances so sleepers become ready; a main-thread wait nobody can end returns as a timeout, or as a spurious wakeup for an untimed
+  one (allowed by POSIX), and a main-thread wait on a mutex held by a parked thread is reported as a deadlock.
+- TLS is one block per module, shared by all guest threads (only one runs at a time, so this is safe unless a thread is switched out inside code
+  that holds thread-local state). pthread keys are shared too. A worker that computes for a long time without blocking holds the audio call.
+- Fixture: `poc/mpc_host/threadtest/` routes every parameter write through a worker (mutex and condition variable); `smoke.sh` and CI run it.
+  Parameter 0 reads back one set late there: the wrapper holds parameter 0 until the next call (`pend0`), and the worker only runs after a call.
+  Checked 2026-11-06, emulated: lucky dip, model72, monomodule_fx and the fixture pass the state check; jv880 loads and sets parameters (its ROMs are not installed).
+- `MPC_HOST_TRACE=1` prints every thunk call with the guest thread id. That showed a polling worker (`opendir`, `nanosleep`) running forever
+  until the clock was only advanced while the main thread waits.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Next: threads (`pthread_create`), `dl_iterate_phdr` and exceptions, cratedigger and rhythmbank, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` and exceptions, machinedrum_one's restore, MM-303, the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 

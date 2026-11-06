@@ -18,5 +18,5 @@ mkdir -p "$OUT/armv7"
 "$OUT/mpc_host" "$SO_OUT" - 2 "$OUT/smoke" | tee "$OUT/smoke.txt"
 grep -q '^emulated: ' "$OUT/smoke.txt" && grep -q 'median' "$OUT/smoke.txt"
 # The statetest fixture has settable parameters and a chunk: the host must round-trip both.
-case $CFG in *statetest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
+case $CFG in *statetest*|*threadtest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
 echo "smoke: passed"

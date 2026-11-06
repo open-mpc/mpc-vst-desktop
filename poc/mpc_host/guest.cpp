@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/time.h>
 #include <elf.h>
 #include <fstream>
 #include <functional>
@@ -92,7 +93,144 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     void CallSVC(uint32_t n) override {
         if (n == kRetSvc) { jit->HaltExecution(); return; }
         if (n >= thunks.size()) { std::fprintf(stderr, "guest: bad svc %u\n", n); std::abort(); }
+        static const bool trace = std::getenv("MPC_HOST_TRACE") != nullptr;   // every thunk call, with the guest thread
+        if (trace) std::fprintf(stderr, "[t%u] %s(%x,%x,%x)\n", th.empty() ? 0 : th[cur]->id, thunk_names[n].c_str(), r(0), r(1), r(2));
         thunks[n](*this);
+    }
+
+    // --- cooperative guest threads ---
+    // One JIT, one running thread at a time. A switch happens inside a thunk by swapping the register file, so the thread that
+    // blocks resumes at the `bx lr` after its own svc. A new thread runs first, until it blocks or exits. Threads run only inside a
+    // host call(); when the call returns, the runnable workers are drained once (drain()). Sleeping workers wake on the next call.
+    enum St { Run, WaitMutex, WaitCond, WaitJoin, Sleep, Done };
+    struct GThread {
+        uint32_t id = 0; St st = Run;
+        std::array<uint32_t, 16> regs{}; std::array<uint32_t, 64> ext{}; uint32_t cpsr = 0x10, fpscr = 0;
+        gaddr obj = 0, mtx = 0, join_ret = 0;   // what it waits on, the mutex to take again after a cond wait, where join stores the result
+        bool signaled = false, timed = false;
+        uint32_t retval = 0, sleep_call = 0;
+    };
+    std::vector<std::unique_ptr<GThread>> th;
+    size_t cur = 0;
+    uint32_t call_no = 0, switches = 0;
+    bool main_active = false;
+    gaddr thread_exit_stub = 0;
+
+    GThread& me() { return *th[cur]; }
+    // mutex layout (glibc armhf): count at +4, owner at +8, kind at +12 (1 = recursive)
+    bool mutex_free(gaddr mu) { return rd<uint32_t>(mu + 8) == 0; }
+    bool try_lock(gaddr mu, uint32_t tid) {
+        const uint32_t owner = rd<uint32_t>(mu + 8);
+        if (owner == 0) { wr<uint32_t>(mu + 8, tid); wr<uint32_t>(mu + 4, 1); return true; }
+        if (owner == tid && rd<uint32_t>(mu + 12) == 1) { wr<uint32_t>(mu + 4, rd<uint32_t>(mu + 4) + 1); return true; }
+        return false;
+    }
+    void unlock(gaddr mu) {
+        const uint32_t c = rd<uint32_t>(mu + 4);
+        if (c > 1) { wr<uint32_t>(mu + 4, c - 1); return; }
+        wr<uint32_t>(mu + 8, 0); wr<uint32_t>(mu + 4, 0);
+    }
+    bool ready(GThread& t) {
+        switch (t.st) {
+        case Run: return true;
+        case WaitMutex: return mutex_free(t.obj) || (rd<uint32_t>(t.obj + 12) == 1 && rd<uint32_t>(t.obj + 8) == t.id);
+        case WaitCond: return t.signaled && mutex_free(t.mtx);
+        case WaitJoin: return th[t.obj - 1]->st == Done;
+        case Sleep: return call_no > t.sleep_call;
+        case Done: return false;
+        }
+        return false;
+    }
+    void save(GThread& t) { t.regs = jit->Regs(); t.ext = jit->ExtRegs(); t.cpsr = jit->Cpsr(); t.fpscr = jit->Fpscr(); }
+    void load(GThread& t) { jit->Regs() = t.regs; jit->ExtRegs() = t.ext; jit->SetCpsr(t.cpsr); jit->SetFpscr(t.fpscr); jit->ClearExclusiveState(); }
+    // The wait ended: take the mutex, store a join result, and make the blocking call return `r0`.
+    void finish_wait(GThread& t, uint32_t r0) {
+        switch (t.st) {
+        case WaitMutex: try_lock(t.obj, t.id); break;
+        case WaitCond: try_lock(t.mtx, t.id); break;
+        case WaitJoin: if (t.join_ret) wr<uint32_t>(t.join_ret, th[t.obj - 1]->retval); break;
+        default: break;
+        }
+        if (t.st != Run) t.regs[0] = r0;
+        t.st = Run; t.signaled = false;
+    }
+    // Picks the next thread after the current one (round robin), switches to it and returns true; false if none could run.
+    // If nothing is ready: advance the clock for sleepers, then (main thread, inside a call) wake the main thread as a timeout.
+    bool schedule() {
+        const size_t n = th.size();
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t k = 1; k <= n; k++) {
+                const size_t j = (cur + k) % n;
+                if (j == 0 && !main_active) continue;
+                GThread& t = *th[j];
+                if (t.st == Done || !ready(t)) continue;
+                if (j != cur) { save(me()); cur = j; load(t); }
+                finish_wait(t, 0);
+                if (j != cur || true) jit->Regs()[0] = t.regs[0];
+                return true;
+            }
+            bool sleepers = false;   // time passes only while the main thread waits inside a call; in drain() a sleeper waits for the next call
+            for (auto& t : th) if (t->st == Sleep) sleepers = true;
+            if (!sleepers || !main_active) break;
+            call_no++;
+        }
+        if (main_active && th[0]->st != Done && th[0]->st != Run) {   // deadlock or a timed wait: the main thread gives up waiting
+            GThread& t = *th[0];
+            if (t.st == WaitMutex || (t.st == WaitCond && !mutex_free(t.mtx))) { std::fprintf(stderr, "guest: deadlock (main thread waits on a held mutex)\n"); std::abort(); }
+            if (cur != 0) { save(me()); cur = 0; load(t); }
+            finish_wait(t, t.timed ? 110 : 0);
+            return true;
+        }
+        return false;
+    }
+    // Blocks the current thread in state `st`; returns once something else ran, or immediately if it is the only thread that can.
+    void block(St st, gaddr obj) {
+        GThread& t = me();
+        t.st = st; t.obj = obj; t.sleep_call = call_no;
+        if (!schedule()) { save(t); jit->HaltExecution(); }   // a worker with nothing to do: back to the host
+    }
+    void yield() {
+        if (th.size() < 2) return;
+        GThread& t = me(); t.st = Run;
+        const size_t before = cur;
+        for (size_t k = 1; k < th.size(); k++) {
+            const size_t j = (before + k) % th.size();
+            if ((j == 0 && !main_active) || th[j]->st == Done || !ready(*th[j])) continue;
+            save(t); cur = j; load(*th[j]); finish_wait(*th[j], 0); jit->Regs()[0] = th[j]->regs[0] = (th[j]->regs[0]);
+            return;
+        }
+    }
+    uint32_t spawn(gaddr fn, uint32_t arg) {
+        auto t = std::make_unique<GThread>();
+        t->id = (uint32_t)th.size() + 1;
+        const gaddr stack = malloc_(512 * 1024);
+        t->regs[0] = arg; t->regs[13] = (stack + 512 * 1024 - 16) & ~7u; t->regs[14] = thread_exit_stub; t->regs[15] = fn & ~1u;
+        t->cpsr = 0x10 | ((fn & 1) ? 0x20 : 0);
+        const uint32_t id = t->id;
+        th.push_back(std::move(t));
+        // child first: the parent stays runnable and gets 0 back from pthread_create when the child blocks or exits
+        jit->Regs()[0] = 0;
+        save(me()); cur = th.size() - 1; load(*th.back());
+        return id;
+    }
+    void exit_thread(uint32_t retval) {
+        GThread& t = me(); t.st = Done; t.retval = retval;
+        if (!schedule()) { jit->HaltExecution(); }
+    }
+    // After a host call returns: let workers that can run do so once. Registers the host call needs are put back.
+    void drain() {
+        if (th.size() < 2) return;
+        const auto R = jit->Regs(); const auto E = jit->ExtRegs(); const uint32_t cpsr = jit->Cpsr(), fpscr = jit->Fpscr();
+        switches = 0;
+        for (int round = 0; round < 1000; round++) {
+            size_t w = 0;
+            for (size_t j = 1; j < th.size(); j++) if (th[j]->st != Done && ready(*th[j])) { w = j; break; }
+            if (!w) break;
+            cur = w; load(*th[w]); finish_wait(*th[w], 0); jit->Regs()[0] = th[w]->regs[0];
+            depth++; jit->Run(); jit->ClearHalt(Dynarmic::HaltReason::UserDefined1); depth--;
+        }
+        cur = 0;
+        jit->Regs() = R; jit->ExtRegs() = E; jit->SetCpsr(cpsr); jit->SetFpscr(fpscr);
     }
 
     // --- argument access (armhf AAPCS) ---
@@ -329,9 +467,36 @@ std::vector<Entry> libc_table() {
     add("__clock_gettime64", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int64_t>(p, ts.tv_sec); i.wr<int32_t>(p + 8, (int32_t)ts.tv_nsec); i.wr<int32_t>(p + 12, 0); i.ret(0); });
     add("clock_gettime", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int32_t>(p, (int32_t)ts.tv_sec); i.wr<int32_t>(p + 4, (int32_t)ts.tv_nsec); i.ret(0); });
     // threads: one guest thread, so locks are no-ops
-    for (const char* n : {"pthread_mutex_init", "pthread_mutex_destroy", "pthread_mutex_lock", "pthread_mutex_unlock", "pthread_mutex_trylock",
-                          "pthread_mutexattr_init", "pthread_mutexattr_destroy", "pthread_mutexattr_settype", "pthread_mutexattr_setprotocol"})
-        add(n, [](I& i) { i.ret(0); });
+    add("pthread_mutex_init", [](I& i) { std::memset(i.m + i.r(0), 0, 24); if (i.r(1)) i.wr<uint32_t>(i.r(0) + 12, i.rd<uint32_t>(i.r(1))); i.ret(0); });
+    add("pthread_mutexattr_init", [](I& i) { i.wr<uint32_t>(i.r(0), 0); i.ret(0); });
+    add("pthread_mutexattr_settype", [](I& i) { i.wr<uint32_t>(i.r(0), i.r(1)); i.ret(0); });
+    for (const char* n : {"pthread_mutex_destroy", "pthread_mutexattr_destroy", "pthread_mutexattr_setprotocol"}) add(n, [](I& i) { i.ret(0); });
+    add("pthread_mutex_lock", [](I& i) { const gaddr mu = i.r(0); if (i.try_lock(mu, i.me().id)) { i.ret(0); return; } i.ret(0); i.block(I::WaitMutex, mu); });
+    add("pthread_mutex_trylock", [](I& i) { i.ret(i.try_lock(i.r(0), i.me().id) ? 0 : 16); });
+    add("pthread_mutex_unlock", [](I& i) { i.unlock(i.r(0)); i.ret(0); });
+    auto cond_wait = [](I& i, bool timed) {
+        const gaddr c = i.r(0), mu = i.r(1);
+        i.ret(0);
+        i.unlock(mu);
+        i.me().mtx = mu; i.me().signaled = false; i.me().timed = timed;
+        i.block(I::WaitCond, c);
+    };
+    add("pthread_cond_wait", [cond_wait](I& i) { cond_wait(i, false); });
+    add("pthread_cond_timedwait", [cond_wait](I& i) { cond_wait(i, true); });
+    add("pthread_cond_clockwait", [cond_wait](I& i) { cond_wait(i, true); });
+    add("pthread_cond_signal", [](I& i) { for (auto& t : i.th) if (t->st == I::WaitCond && t->obj == i.r(0) && !t->signaled) { t->signaled = true; break; } i.ret(0); });
+    add("pthread_cond_broadcast", [](I& i) { for (auto& t : i.th) if (t->st == I::WaitCond && t->obj == i.r(0)) t->signaled = true; i.ret(0); });
+    add("pthread_create", [](I& i) { const gaddr thr = i.r(0), fn = i.r(2), arg = i.r(3); const uint32_t id = i.th.size() + 1; i.wr<uint32_t>(thr, id); i.spawn(fn, arg); });
+    add("pthread_join", [](I& i) {
+        const uint32_t t = i.r(0); if (t < 1 || t > i.th.size()) { i.ret(3); return; }   // ESRCH
+        i.me().join_ret = i.r(1); i.ret(0);
+        i.block(I::WaitJoin, t); });
+    add("pthread_self", [](I& i) { i.ret(i.me().id); });
+    add("sched_yield", [](I& i) { i.ret(0); i.yield(); });
+    for (const char* n : {"usleep", "sleep"}) add(n, [](I& i) { i.ret(0); i.block(I::Sleep, 0); });
+    add("nanosleep", [](I& i) { i.ret(0); i.block(I::Sleep, 0); });
+    add("clock_nanosleep", [](I& i) { i.ret(0); i.block(I::Sleep, 0); });
+    add("poll", [](I& i) { i.ret(0); if (i.r(2) != 0) i.block(I::Sleep, 0); });
     // process
     add("raise", [](I& i) { std::fprintf(stderr, "guest: raise(%u)\n", i.r(0)); std::abort(); });
     add("abort", [](I& i) { abort_named(i, "abort"); });
@@ -368,9 +533,8 @@ std::vector<Entry> libc_table() {
     add("strerror", [](I& i) { i.ret(i.cstr("error")); });
     add("__assert_fail", [](I& i) { std::fprintf(stderr, "guest: assert %s at %s:%u\n", i.str(i.r(0)), i.str(i.r(1)), i.r(2)); std::abort(); });
     add("syscall", [](I& i) { abort_named(i, "syscall"); });
-    add("pthread_create", [](I& i) { abort_named(i, "pthread_create (threads are not implemented)"); });
-    for (const char* n : {"pthread_cond_wait", "pthread_cond_signal", "pthread_cond_broadcast", "pthread_cond_destroy", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
-                          "pthread_rwlock_unlock", "pthread_detach", "sched_yield", "__cxa_thread_atexit_impl"})
+    for (const char* n : {"pthread_cond_destroy", "pthread_cond_init", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
+                          "pthread_rwlock_unlock", "pthread_detach", "__cxa_thread_atexit_impl"})
         add(n, [](I& i) { i.ret(0); });   // one thread: nothing to wait for or wake
     add("memchr", [](I& i) { const void* p = std::memchr(i.m + i.r(0), (int)i.r(1), i.r(2)); i.ret(p ? (uint32_t)(static_cast<const uint8_t*>(p) - i.m) : 0); });
     add("strdup", [](I& i) { i.ret(i.g.strdup(i.str(i.r(0)))); });
@@ -443,7 +607,7 @@ std::vector<Entry> libc_table() {
     add("__iswctype_l", [](I& i) { i.ret(i.r(0) < 128 ? (uint32_t)std::iswctype(i.r(0), (wctype_t)i.r(1)) : 0); });
     add("secure_getenv", [](I& i) { i.ret(0); });
     // no filesystem for guests: opens and reads fail the way a missing file would
-    for (const char* n : {"opendir", "readdir", "readdir64", "closedir", "fread", "fgets", "fwrite", "fputc", "fputs", "fclose", "usleep"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"opendir", "readdir", "readdir64", "closedir", "fread", "fgets", "fwrite", "fputc", "fputs", "fclose"}) add(n, [](I& i) { i.ret(0); });
     for (const char* n : {"fseek", "ftell", "mkdir", "access", "remove", "rename"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("rand", [](I& i) { i.ret((uint32_t)std::rand()); });
     add("srand", [](I& i) { std::srand(i.r(0)); });
@@ -475,7 +639,10 @@ std::vector<Entry> libc_table() {
     for (const char* n : {"setrlimit", "pthread_attr_setstacksize", "pthread_attr_setdetachstate"}) add(n, [](I& i) { i.ret(0); });
     add("aligned_alloc", [](I& i) { const gaddr p = i.malloc_(i.r(1) + i.r(0)); i.ret((p + i.r(0) - 1) & ~(i.r(0) - 1)); });
     add("setenv", [](I& i) { i.ret(0); });
-    add("pthread_self", [](I& i) { i.ret(1); });
+    add("bcmp", [](I& i) { i.ret((uint32_t)std::memcmp(i.m + i.r(0), i.m + i.r(1), i.r(2))); });
+    for (const char* n : {"pthread_getschedparam", "pthread_getattr_np", "pthread_attr_getstack", "pthread_attr_getguardsize", "sched_getaffinity"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    for (const char* n : {"socketpair", "socket", "pipe"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    add("gettimeofday", [](I& i) { timeval tv; gettimeofday(&tv, nullptr); if (i.r(0)) { i.wr<int32_t>(i.r(0), (int32_t)tv.tv_sec); i.wr<int32_t>(i.r(0) + 4, (int32_t)tv.tv_usec); } i.ret(0); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
     // C++ runtime
@@ -523,6 +690,9 @@ Guest::Guest() {
     // index 0: a trap at guest address 0 (a call through a null pointer, e.g. an unresolved weak import)
     impl_->add_thunk("<null>", [](I& i) { std::fprintf(stderr, "guest: call to address 0 from lr=%08x\n", i.r(14)); std::abort(); });
     impl_->wr<uint32_t>(0, 0xEF000000u);   // svc #0 at address 0
+    impl_->th.push_back(std::make_unique<Guest::Impl::GThread>());
+    impl_->th[0]->id = 1;
+    impl_->thread_exit_stub = impl_->add_thunk("<thread exit>", [](I& i) { i.exit_thread(i.r(0)); });
     const gaddr ret = kData - 8;
     impl_->wr<uint32_t>(ret, 0xEF000000u | kRetSvc);
 
@@ -579,11 +749,16 @@ uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vec
     R[14] = kData - 8;   // return stub
     R[15] = fn & ~1u;
     i.jit->SetCpsr(0x10 | ((fn & 1) ? 0x20 : 0));   // user mode, Thumb if bit 0
+    i.call_no++; i.cur = 0; i.main_active = true;
     i.depth++;
     i.jit->Run();
     i.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
     i.depth--;
+    i.main_active = false;
     const uint32_t r0 = R[0];
+    const uint32_t s0 = i.jit->ExtRegs()[0], s1 = i.jit->ExtRegs()[1];   // a double result lives in s0/s1
+    i.drain();
+    i.jit->ExtRegs()[0] = s0; i.jit->ExtRegs()[1] = s1;
     R = saved;
     R[0] = r0;
     if (!saved[13]) R[13] = 0;

@@ -44,3 +44,5 @@ jobs:
         run: poc/mpc_host/smoke.sh
       - name: Parameters and state chunks round-trip emulated
         run: poc/mpc_host/smoke.sh poc/mpc_host/statetest/vst.json
+      - name: Guest threads (mutex, condition variable, worker) emulated
+        run: poc/mpc_host/smoke.sh poc/mpc_host/threadtest/vst.json

@@ -228,6 +228,7 @@ bool state_check(const char* what, Plugin& p) {
     for (int i = 0; i < p.num_params() && idx.size() < 8; i++) {
         p.set_param(i, 0.25f); const float v = p.get_param(i);
         p.set_param(i, 0.75f); const float w = p.get_param(i);
+        if (std::getenv("MPC_HOST_DUMP")) std::printf("  param %d: set 0.25 reads %.3f, set 0.75 reads %.3f\n", i, v, w);
         if (std::fabs(v - 0.25f) < 0.15f && std::fabs(w - 0.75f) < 0.15f && w > v) idx.push_back(i);   // quantised parameters round
     }
     if (idx.empty()) { std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
@@ -236,6 +237,7 @@ bool state_check(const char* what, Plugin& p) {
     for (int i : idx) p.set_param(i, 0.75f);
     if (chunk.empty()) { std::printf("%-9s state: %zu settable parameters, no chunk (ok)\n", what, idx.size()); return true; }
     const bool restored = p.set_chunk(chunk);
+    { float l[kBlock], r[kBlock]; p.process(l, r); p.process(l, r); }   // some ports apply a restored state on the next audio block
     std::string bad; int good = 0;
     for (size_t k = 0; k < idx.size(); k++) {
         const float c = p.get_param(idx[k]);
