@@ -34,7 +34,7 @@ if [ ! -f "$OUT/dynarmic/src/dynarmic/libdynarmic.a" ]; then
 fi
 LIBS=$(find "$OUT/dynarmic" -name '*.a' | grep -v libdynarmic.a | tr '\n' ' ')
 VERSION=$(git -C "$HERE" describe --always --dirty 2>/dev/null || echo dev)
-"$CXX" -std=c++20 -O2 -g -Wall -DMPC_HOST_VERSION="\"$VERSION\"" -I"$DYN/src" -I"$DYN/externals/mcl/include" -I"${BOOST_INCLUDEDIR:-/usr/include}" "$HERE/guest.cpp" "$HERE/main.cpp" \
+"$CXX" -std=c++20 -O2 -g -Wall -DMPC_HOST_VERSION="\"$VERSION\"" -I"$DYN/src" -I"$DYN/externals/mcl/include" -I"${BOOST_INCLUDEDIR:-/usr/include}" "$HERE/guest.cpp" "$HERE/hosted.cpp" "$HERE/main.cpp" \
     "$OUT/dynarmic/src/dynarmic/libdynarmic.a" $LIBS $LIBS -static -o "$OUT/mpc_host.exe"
 # the guest helper libraries are armhf / aarch64 ELF files, the same on every host: reuse the ones build.sh made
 for h in guest_helpers.so guest_helpers64.so; do [ -f "$HERE/build/$h" ] && cp "$HERE/build/$h" "$OUT/$h"; done

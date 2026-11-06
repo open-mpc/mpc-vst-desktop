@@ -1,7 +1,7 @@
 // Prototype driver: renders the same MIDI through an armv7 MPC plugin (emulated) and, optionally, a native build
 // of the same port, then reports CPU per block and how close the two outputs are. See docs/MPC_HOST.md.
 //   mpc_host <armv7 .so> [native .so] [seconds] [out prefix]
-#include "guest.h"
+#include "hosted.h"
 
 #include <chrono>
 #include <cmath>
@@ -59,114 +59,26 @@ struct Plugin {
     virtual void process(float* l, float* r) = 0;
 };
 
-// --- emulated armv7 plugin ---
-struct GuestTime { double samplePos, sampleRate, nanoSeconds, ppqPos, tempo, barStartPos, cycleStartPos, cycleEndPos;
-                   int32_t num, den, smpte, smpteRate, toClock, flags; };
-gaddr g_time = 0;
-uint32_t guest_master(Guest&, uint32_t, int32_t op, int32_t, int32_t, uint32_t, float) {
-    if (op == 1) return 2400;      // audioMasterVersion
-    if (op == 7) return g_time;    // audioMasterGetTime
-    return 0;
-}
-
+// --- the emulated plugin: the command-line driver is a thin user of HostedPlugin (hosted.h), the same library the VST3 module uses ---
 struct Emulated : Plugin {
-    Guest g;
-    const bool a64;
-    // AEffect layout: armhf (4-byte pointers, as in vst2_wrap.c) or aarch64 (8-byte pointers)
-    int o_disp() const { return a64 ? 8 : 4; }
-    int o_setp() const { return a64 ? 24 : 12; }
-    int o_getp() const { return a64 ? 32 : 16; }
-    int o_nparams() const { return a64 ? 44 : 24; }
-    int o_nout() const { return a64 ? 52 : 32; }
-    int o_proc() const { return a64 ? 120 : 80; }
-    uint32_t ps() const { return a64 ? 8 : 4; }
-    void wrp(gaddr a, uint32_t v) { g.wr32(a, v); if (a64) g.wr32(a + 4, 0); }
-    explicit Emulated(bool a64_) : g(a64_), a64(a64_) {}
-    gaddr eff = 0, disp = 0, proc = 0, buf_l = 0, buf_r = 0, outs = 0, ins = 0, evs = 0, ev = 0;
-    int nev = 0;
-    bool open(const char* path) {
-        // libc functions that call back into guest code (qsort, bsearch) are guest code too: guest_helpers.so, built next to this program
-        {
-            const std::string exe = exe_path();
-            if (!exe.empty()) { const std::string h = exe.substr(0, exe.find_last_of("/\\")) + (a64 ? "/guest_helpers64.so" : "/guest_helpers.so"); if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
-        }
-        // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
-        // with no MPC_HOST_LIBS, libgcc_s and libstdc++ for this architecture are taken from guestlibs/<armv7|aarch64>/ next to this program, if they are there
-        if (!std::getenv("MPC_HOST_LIBS")) {
-            const std::string exe = exe_path();
-            if (!exe.empty()) {
-                const std::string d = exe.substr(0, exe.find_last_of("/\\")) + "/guestlibs/" + (a64 ? "aarch64" : "armv7") + "/";
-                for (const char* lib : {"libgcc_s.so.1", "libstdc++.so.6"})
-                    if (FILE* f = std::fopen((d + lib).c_str(), "rb")) { std::fclose(f); if (!g.load(d + lib)) { std::fprintf(stderr, "load %s%s: %s\n", d.c_str(), lib, g.error().c_str()); return false; } }
-            }
-        }
-        if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
-            std::string l = libs;
-            for (size_t b = 0; b < l.size();) {
-                size_t e = l.find(kPathSep, b); if (e == std::string::npos) e = l.size();
-                if (e > b && !g.load(l.substr(b, e - b))) { std::fprintf(stderr, "load %s: %s\n", l.substr(b, e - b).c_str(), g.error().c_str()); return false; }
-                b = e + 1;
-            }
-        }
-        if (!g.load(path)) { std::fprintf(stderr, "load: %s\n", g.error().c_str()); return false; }
-        const gaddr main = g.symbol("VSTPluginMain");
-        if (!main) { std::fprintf(stderr, "no VSTPluginMain\n"); return false; }
-        g_time = g.alloc(sizeof(GuestTime));
-        auto* t = g.ptr<GuestTime>(g_time);
-        std::memset(t, 0, sizeof *t);
-        t->sampleRate = kRate; t->tempo = 120; t->num = 4; t->den = 4; t->flags = (1 << 10) | (1 << 9);
-        eff = g.call(main, {g.host_callback(guest_master)});
-        if (!eff || g.rd32(eff) != 0x56737450) { std::fprintf(stderr, "VSTPluginMain returned no AEffect\n"); return false; }
-        disp = g.rd32(eff + o_disp());
-        proc = g.rd32(eff + o_proc());       // processReplacing (see vst2_wrap.c struct AEffect)
-        buf_l = g.alloc(kBlock * 4); buf_r = g.alloc(kBlock * 4);
-        outs = g.alloc(16); wrp(outs, buf_l); wrp(outs + ps(), buf_r);
-        ins = g.alloc(16); const gaddr z = g.alloc(kBlock * 4); std::memset(g.host(z), 0, kBlock * 4); wrp(ins, z); wrp(ins + ps(), z);
-        evs = g.alloc(16 + 8 * 64); ev = g.alloc(32 * 64);
-        return true;
-    }
-    uint32_t dispatch(int32_t op, int32_t idx, int32_t val, uint32_t ptr, float opt) { return g.call(disp, {eff, (uint32_t)op, (uint32_t)idx, (uint32_t)val, ptr}, {opt}); }
-    std::string name() override { const gaddr b = g.alloc(256); g.host(b)[0] = 0; dispatch(effGetEffectName, 0, 0, b, 0); std::string s = (char*)g.host(b); g.dealloc(b); return s; }
-    int num_params() override { return (int32_t)g.rd32(eff + o_nparams()); }
-    int num_outputs() override { return (int32_t)g.rd32(eff + o_nout()); }
-    void start() override { dispatch(effOpen, 0, 0, 0, 0); dispatch(effSetSampleRate, 0, 0, 0, (float)kRate); dispatch(effSetBlockSize, 0, kBlock, 0, 0); dispatch(effMainsChanged, 0, 1, 0, 0); }
-    void set_param(int i, float v) override { g.call(g.rd32(eff + o_setp()), {eff, (uint32_t)i}, {v}); }
-    float get_param(int i) override { return g.call_f(g.rd32(eff + o_getp()), {eff, (uint32_t)i}); }
-    std::vector<uint8_t> get_chunk() override {
-        const gaddr pp = g.alloc(8); g.wr32(pp, 0); g.wr32(pp + 4, 0);
-        const int32_t n = (int32_t)dispatch(effGetChunk, 0, 0, pp, 0);
-        const gaddr data = g.rd32(pp);
-        std::vector<uint8_t> c;
-        if (n > 0 && data) c.assign(g.host(data), g.host(data) + n);
-        g.dealloc(pp);
-        return c;
-    }
-    bool set_chunk(const std::vector<uint8_t>& c) override {
-        const gaddr b = g.alloc((uint32_t)c.size());
-        std::memcpy(g.host(b), c.data(), c.size());
-        const bool ok = dispatch(effSetChunk, 0, (int32_t)c.size(), b, 0) != 0;
-        g.dealloc(b);
-        return ok;
-    }
-    void midi(const uint8_t m[3]) override {
-        const gaddr e = ev + 32 * nev;
-        std::memset(g.host(e), 0, 32);
-        g.wr32(e, 1); g.wr32(e + 4, 32);
-        std::memcpy(g.host(e + 24), m, 3);
-        wrp(evs + (a64 ? 16 : 8) + ps() * nev, e);
-        nev++;
-    }
-    void process(float* l, float* r) override {
-        if (nev) { g.wr32(evs, nev); g.wr32(evs + 4, 0); if (a64) { g.wr32(evs + 8, 0); g.wr32(evs + 12, 0); } dispatch(effProcessEvents, 0, 0, evs, 0); nev = 0; }
-        g.call(proc, {eff, ins, outs, (uint32_t)kBlock});
-        std::memcpy(l, g.host(buf_l), kBlock * 4);
-        std::memcpy(r, g.host(buf_r), kBlock * 4);
-        g.ptr<GuestTime>(g_time)->samplePos += kBlock;
-    }
+    HostedPlugin h;
+    bool open(const char* path) { std::string err; if (!h.open(path, {}, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return false; } return true; }
+    std::string name() override { return h.name(); }
+    int num_params() override { return h.num_params(); }
+    int num_outputs() override { return h.num_outputs(); }
+    void start() override { h.start(); }
+    void set_param(int i, float v) override { h.set_param(i, v); }
+    float get_param(int i) override { return h.get_param(i); }
+    std::vector<uint8_t> get_chunk() override { return h.get_chunk(); }
+    bool set_chunk(const std::vector<uint8_t>& c) override { return h.set_chunk(c); }
+    void midi(const uint8_t m[3]) override { h.midi(m[0], m[1], m[2]); }
+    void process(float* l, float* r) override { h.process(l, r); }
 };
 
 #ifndef _WIN32
 // --- native build of the same port (host AEffect layout) ---
+struct GuestTime { double samplePos, sampleRate, nanoSeconds, ppqPos, tempo, barStartPos, cycleStartPos, cycleEndPos;
+                   int32_t num, den, smpte, smpteRate, toClock, flags; };
 struct AEffect;
 typedef intptr_t (*Master)(AEffect*, int32_t, int32_t, intptr_t, void*, float);
 struct AEffect {
@@ -329,7 +241,7 @@ int probe(const char* path, int out_fd, const char* prefix = "") {
     std::string verdict = "ok", name;
     double med_pct = 0, p99_pct = 0, rms = 0;
     std::string state = "n/a";
-    auto emu = std::make_unique<Emulated>(a64);
+    auto emu = std::make_unique<Emulated>();
     if (!emu->open(path)) { verdict = "blocked"; reasons.push_back("could not load or start the plugin"); }
     else {
         name = emu->name();
@@ -341,7 +253,7 @@ int probe(const char* path, int out_fd, const char* prefix = "") {
         double sum = 0; for (float s : a.l) sum += (double)s * s; rms = std::sqrt(sum / std::max<size_t>(1, a.l.size()));
         const bool state_ok = state_check("emulated", *emu);
         state = g_state_note.empty() ? "n/a" : g_state_note;
-        if (!emu->g.stubs_called().empty()) { verdict = "blocked"; reasons.push_back("calls functions the host does not provide: " + [&] { std::string s; for (auto& n : emu->g.stubs_called()) s += (s.empty() ? "" : ", ") + n; return s; }()); }
+        if (!emu->h.guest().stubs_called().empty()) { verdict = "blocked"; reasons.push_back("calls functions the host does not provide: " + [&] { std::string s; for (auto& n : emu->h.guest().stubs_called()) s += (s.empty() ? "" : ", ") + n; return s; }()); }
         if (med_pct >= kBlockedPct || p99_pct >= kP99BlockedPct) { verdict = "blocked"; char b[160]; std::snprintf(b, sizeof b, "too slow for real time here: median %.0f%% and p99 %.0f%% of a block", med_pct, p99_pct); reasons.push_back(b); }
         else if (med_pct >= kDegradedPct || p99_pct >= kP99DegradedPct) { if (verdict == "ok") verdict = "degraded"; char b[160]; std::snprintf(b, sizeof b, "heavy: median %.0f%% and p99 %.0f%% of a block", med_pct, p99_pct); warnings.push_back(b); }
         if (!state_ok) { if (verdict == "ok") verdict = "degraded"; warnings.push_back("state does not fully round-trip (" + state + ")"); }
@@ -452,7 +364,7 @@ int main(int argc, char** argv) {
     // an ELF64 plugin is aarch64 (Gen2), an ELF32 one armhf (Gen1)
     bool a64 = false;
     if (FILE* f = std::fopen(argv[1], "rb")) { unsigned char id[5] = {}; if (std::fread(id, 1, 5, f) == 5) a64 = id[4] == 2; std::fclose(f); }
-    auto emu = std::make_unique<Emulated>(a64);
+    auto emu = std::make_unique<Emulated>();
     if (!emu->open(argv[1])) return 1;
     std::printf("emulated: \"%s\", %d params, %d outputs\n", emu->name().c_str(), emu->num_params(), emu->num_outputs());
     const Run a = render(*emu, blocks);
