@@ -65,18 +65,34 @@ runs `sha256sum` and `unzip` as child processes, writes the plugin folders and `
 
 Still to decide (see below): which hosts the curl shim may reach, and whether switching the hosted plugin inside one VST3 instance is wanted, or the user should instead generate a bundle per plugin.
 
-## Milestones
+## Decisions (owner, 2026-11-07)
 
-1. **M1 core module**, Linux: factory, runtime parameters, audio, MIDI, state; generic DAW parameter view; default bundle contents = the manager. Test with `tools/vst3_host_test.c` (needs a small switch for hosted bundles).
-2. **M2 packer**: `make_hosted_vst3.py` from a released plugin zip.
-3. **M3 editor**, Linux: the skin in the window, live values, touch.
-4. **M4 Q-Links**: parameters and knobs, 4 / 8 modes, bank button; `desktop_skin.py` writes the Q-Link sets.
-5. **M5 manager services**: curl shim, `sha256sum` / `unzip` built-ins, rescan and switch.
-6. **M6 Windows**: the module as a `.vst3` DLL (mingw, as for the source-built VST3), then a Win32 editor.
+- **One VST3**, "OpenMPC Host": it starts on the Plugin Manager and switches the hosted plugin inside the instance (a plugin picker in the editor and a `Plugin` entry in the state). Per-plugin bundles are optional later.
+- **Q-Links default to 4 knobs** (8 selectable); **the Q-Link parameters are visible in the DAW's parameter list** (Q-Link 1..8, Bank, Next Bank, Mode).
+- **Network:** the curl shim may reach any `https://` URL (GET only, to a file or memory; no other protocols).
+- **Windows first** (`.vst3` DLL via mingw, Win32 editor), then Linux (X11 editor exists), macOS deferred.
 
-## Questions for the owner
+## Milestones (Windows first)
 
-- **Switching inside one VST3, or one bundle per plugin?** The first suits the manager-as-default idea (install, then pick); the second matches how DAWs name and save plugins. Both can exist (a "launcher" bundle plus per-plugin bundles).
-- **Q-Link default:** 4 or 8? And should the Q-Link parameters be visible in the DAW's list or only through the editor and a mapped controller?
-- **Network:** may the curl shim reach only the catalog host (`open-mpc.github.io`) and GitHub release downloads, or any `https://` URL?
-- **Platforms first:** Linux (X11 editor exists) or Windows (no editor yet)?
+1. **M1 core module** (portable C++/C, built as a Windows `.vst3` with mingw and as a Linux `.vst3`): factory, one object as IComponent + IAudioProcessor + IEditController, runtime parameters from `HostedPlugin`, audio (128-frame blocks at 44.1 kHz, resampled), MIDI, state (`Plugin` name + chunk), Q-Link/Bank/Next/Mode parameters. Default plugin = the manager. Test: `tools/vst3_host_test.c` (add a hosted-module switch), then Wine, then the user's Windows DAW.
+2. **M2 plugin discovery and switching:** scan `<root>/sdcard/Synths` (and the plugin folder next to the module) for `.so` + skin; switch plugin in an instance; remember it in state.
+3. **M3 manager services:** curl shim (`libcurl.so.4` dlopen -> host HTTPS via WinHTTP on Windows / a small socket+TLS-free fallback is not allowed; use WinHTTP, libcurl on Linux), built-in `sha256sum` and `unzip`, rescan after install.
+4. **M4 Win32 editor:** the skin in the window (GDI+/Direct2D), live values, touch/mouse, plugin picker, Q-Link strip with bank button. Then the X11 editor from `vst3_editor.c`.
+5. **M5 Q-Link sets from skins:** `tools/desktop_skin.py` writes the page's Q-Link set (TUI.json `qlinks`); fallback parameter order `b*mode+n`.
+6. **M6 Linux build, packaging, CI** (and docs sync).
+
+## Handoff (state at 2026-11-07)
+
+**Done and committed:** `poc/mpc_host/hosted.{h,cpp}` (`HostedPlugin`, per-instance: `open`, `start`, `num_params`, `param_name/label/display`, `set_param/get_param`, `midi(status,d1,d2,delta)`, `set_transport`, `process(l,r)` in 128-frame blocks, `get_chunk/set_chunk`, `take_automation`, `take_display_dirty`; not thread-safe, so the VST3 holds one mutex). The CLI (`main.cpp`) uses it. Windows build of the CLI works (`build_windows.sh`, `package_windows.sh`, `smoke_windows.sh`; tested under Wine and natively). Design = this file.
+
+**Not started:** any `vst3host/` code.
+
+**Where to begin (M1):**
+1. Create `vst3host/` with `vst3_host.cpp` (hand-written ABI: reuse `mpc-vst-plugins/wrapper/vst3_abi.h` and `resample.h`; model the factory and object layout on `mpc-vst-plugins/wrapper/vst3_wrap.c`), linking `guest.cpp hosted.cpp` and dynarmic from `poc/mpc_host/build*/` (see `build.sh` / `build_windows.sh` for flags).
+2. `vst3host/build_windows.sh` -> `OpenMPC Host.vst3/Contents/x86_64-win/*.vst3` (+ guest runtime libs as in `package_windows.sh`).
+3. Test with a small host (extend `tools/vst3_host_test.c`), then Wine, then the user's Windows 11 PC (WSL interop works: see the earlier Windows test flow; copy to `C:\Users\Sam\Downloads`).
+4. Parameter list is read at load from the hosted plugin; plugin changes must signal `restartComponent(kParamTitlesChanged)`.
+
+**Constraints to keep:** never commit plugin binaries/ROMs/Steinberg SDK; macOS left alone; skip mm-303; commit per concern with the session trailers; docs sync (this file + `docs/MPC_HOST.md`, dated, offline vs DAW). Known limits: ~35 of 57 aarch64 builds restore state fully; JV-880 ~50% of real time (degraded), Osirus ~115% (blocked) on this VM; `--check` verdicts gate which plugins load; the manager needs the M3 services before it can browse or install (it reports "No libcurl" / "No unzip" today).
+
+**Test material:** user's plugins and ROMs in `~/roms` and local folders; fixtures under `poc/mpc_host/{statetest,threadtest,filetest,cxxtest}`; `poc/mpc_host/smoke.sh` (ARCH=armv7|aarch64).
