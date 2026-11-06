@@ -1014,6 +1014,13 @@ std::vector<Entry> libc_table() {
         const char* v[5] = {"Linux", "mpc", "5.15.0", "#1", i.a64 ? "aarch64" : "armv7l"};
         for (int k = 0; k < 5; k++) std::strcpy((char*)i.m + i.r(0) + 65 * k, v[k]);
         i.ret(0); });
+    for (const char* n : {"readlink", "statvfs", "statvfs64", "statfs", "statfs64", "fstatvfs", "realpath"}) add(n, [](I& i) { i.ret(i.fail(2)); });   // no symlinks, no filesystem statistics
+#define ISW(n) add(#n, [](I& i) { i.ret(i.r(0) < 128 && std::n((wint_t)i.r(0)) ? 1 : 0); });   // wide-character classes: ASCII only (the "C" locale)
+    ISW(iswspace) ISW(iswalpha) ISW(iswdigit) ISW(iswalnum) ISW(iswupper) ISW(iswlower) ISW(iswpunct) ISW(iswprint) ISW(iswcntrl) ISW(iswxdigit)
+#undef ISW
+    add("towlower", [](I& i) { i.ret(i.r(0) < 128 ? (uint32_t)std::tolower((int)i.r(0)) : i.r(0)); });
+    add("towupper", [](I& i) { i.ret(i.r(0) < 128 ? (uint32_t)std::toupper((int)i.r(0)) : i.r(0)); });
+    add("gnu_get_libc_version", [](I& i) { i.ret(i.cstr("2.39")); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); const uint32_t off = i.rd<uint32_t>(ti + (i.a64 ? 8 : 4)); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + off); });   // tls_index {module, offset}
     // C++ runtime

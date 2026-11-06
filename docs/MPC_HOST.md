@@ -263,7 +263,8 @@ Checked 2026-11-06 on the 57 aarch64 `VSTPluginMain` builds found in the author'
   - osirus: the restore is ignored (the chunk after still holds the test's values, `rom_model` is `"?"`): it very likely needs its ROM, which is not under the root.
   - machinedrum_one/b: the chunk is exactly 512 bytes for 672 slots, so it is cut off, most likely by a 512-byte chunk buffer in the wrapper copy those builds were made with
     (mpc-vst-plugins now has 8192). Not confirmed against that checkout.
-- **Stops on one import:** welle (`readlink`), the plugin manager (`statvfs`). **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
+- **Welle** (aarch64, after `readlink` and the wide-character class stubs): renders (rms 0.26, peak 0.42, 18% of the budget) and restores 8/8 parameters from a 512 B chunk. **Plugin manager** (`openmpc_pm_g2`): loads, no settable parameter.
+- **Not testable here:** osirus needs a Virus ROM (none under `~/roms`). **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
 
 ## Next steps
 
