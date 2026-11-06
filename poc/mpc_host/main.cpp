@@ -33,6 +33,9 @@ constexpr char kPathSep = ';';   // MPC_HOST_LIBS is a list of paths: ';' on Win
 #else
 constexpr char kPathSep = ':';
 #endif
+#ifndef MPC_HOST_VERSION
+#define MPC_HOST_VERSION "dev"
+#endif
 // the directory the guest helper libraries sit in: next to this program
 std::string exe_path() {
 #ifdef _WIN32
@@ -88,6 +91,15 @@ struct Emulated : Plugin {
             if (!exe.empty()) { const std::string h = exe.substr(0, exe.find_last_of("/\\")) + (a64 ? "/guest_helpers64.so" : "/guest_helpers.so"); if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
         }
         // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
+        // with no MPC_HOST_LIBS, libgcc_s and libstdc++ for this architecture are taken from guestlibs/<armv7|aarch64>/ next to this program, if they are there
+        if (!std::getenv("MPC_HOST_LIBS")) {
+            const std::string exe = exe_path();
+            if (!exe.empty()) {
+                const std::string d = exe.substr(0, exe.find_last_of("/\\")) + "/guestlibs/" + (a64 ? "aarch64" : "armv7") + "/";
+                for (const char* lib : {"libgcc_s.so.1", "libstdc++.so.6"})
+                    if (FILE* f = std::fopen((d + lib).c_str(), "rb")) { std::fclose(f); if (!g.load(d + lib)) { std::fprintf(stderr, "load %s%s: %s\n", d.c_str(), lib, g.error().c_str()); return false; } }
+            }
+        }
         if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
             std::string l = libs;
             for (size_t b = 0; b < l.size();) {
@@ -425,6 +437,7 @@ int check_main(const char* path, int timeout_s) {
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: %s <plugin .so> [native .so] [seconds] [out prefix]\n       %s --check <plugin .so> [timeout seconds]   (prints a JSON verdict; exit 0 ok, 3 degraded, 4 blocked)\n", argv[0], argv[0]); return 2; }
+    if (!std::strcmp(argv[1], "--version")) { std::printf("mpc_host %s\n", MPC_HOST_VERSION); return 0; }
     if (!std::strcmp(argv[1], "--probe") && argc > 2) return probe(argv[2], 1, "MPCHOST_JSON ");
     if (!std::strcmp(argv[1], "--check")) { if (argc < 3) return 2; return check_main(argv[2], argc > 3 ? std::atoi(argv[3]) : 180); }
     // MPC_HOST_ENFORCE=1: check the plugin first and refuse a blocked one (MPC_HOST_FORCE=1 overrides). A host that scans for plugins does the same with --check.

@@ -22,7 +22,7 @@ if [ ! -f "$DYN/build/src/dynarmic/libdynarmic.a" ] || ! grep -q 'DYNARMIC_FRONT
 fi
 B=$DYN/build
 LIBS=$(find "$B" -name '*.a' | grep -v libdynarmic.a | tr '\n' ' ')
-g++ -std=c++20 -O2 -g -Wall -I"$DYN/src" -I"$DYN/externals/mcl/include" "$HERE/guest.cpp" "$HERE/main.cpp" \
+g++ -std=c++20 -O2 -g -Wall -DMPC_HOST_VERSION="\"$(git -C "$HERE" describe --always --dirty 2>/dev/null || echo dev)\"" -I"$DYN/src" -I"$DYN/externals/mcl/include" "$HERE/guest.cpp" "$HERE/main.cpp" \
     "$B/src/dynarmic/libdynarmic.a" $LIBS $LIBS -ldl -o "$OUT/mpc_host"
 # guest-code libc helpers (qsort, bsearch): need the armhf (and for aarch64 guests the aarch64) cross compiler; mpc_host loads $OUT/guest_helpers.so (guest_helpers64.so) when it is there
 if command -v arm-linux-gnueabihf-gcc >/dev/null; then
