@@ -270,11 +270,22 @@ Checked 2026-11-06 on the 57 aarch64 `VSTPluginMain` builds found in the author'
   instead of treating it as a stop (before that the thread restarted from its entry point). Speed: median 3.5 ms per 128-frame block (120% of the 2.9 ms budget), so not real time
   on this VM. Restoring a chunk changes 0/8 of the test's parameters; not looked at further. **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
 
+## Where the time goes (2026-11-06, offline, 4-core VM)
+
+`MPC_HOST_STATS=1` prints the host time spent in each guest thread when the guest is destroyed. aarch64 builds, 4 s of audio at 128-frame blocks:
+- **Osirus:** 80% of the CPU is one guest thread (t5, the DSP56300 emulation; 5.5 s for 4 s of audio, so 1.4 times real time), 9% another, 8% a third, 2% the audio call. Median block 3.2 ms (112% of 2.9 ms).
+- **JV-880:** 74% is the emulation thread (1.9 s for 4 s), 22% another thread, 4% the audio call. Median block 1.48 ms (51%), p99 about 2 ms.
+- `MPC_HOST_UNSAFE=1` (dynarmic's unsafe float flags) changes neither (checked with the variable unset for the baseline: an empty value still counts as set).
+
+So running each guest thread on its own host thread would not make Osirus real time (its critical path is one thread already slower than real time) and would help JV-880 only by
+moving its emulation thread off the audio call. The limit for Osirus is the speed of the translated code (a DSP emulator whose own JIT output is translated again). For such a plugin
+the other path in this repo, rebuilding from source as a native VST3, is the right one.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` for older libgcc, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` for older libgcc, moving emulation threads off the audio call (JV-880 only; see "Where the time goes"), the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 

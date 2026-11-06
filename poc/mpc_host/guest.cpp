@@ -30,6 +30,7 @@
 #include <sys/mman.h>
 #include <unordered_map>
 #include <cwctype>
+#include <chrono>
 
 namespace mpchost {
 
@@ -238,6 +239,16 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<std::unique_ptr<GThread>> th;
     size_t cur = 0;
     uint32_t call_no = 0, switches = 0;
+    // MPC_HOST_STATS=1: host time spent running each guest thread (a slice starts when its context is loaded and ends at the next switch or halt)
+    std::chrono::steady_clock::time_point slice_start; std::vector<double> busy_us; bool stats = std::getenv("MPC_HOST_STATS") != nullptr;
+    void slice_begin() { if (stats) slice_start = std::chrono::steady_clock::now(); }
+    void slice_end() {
+        if (!stats) return;
+        const size_t id = th.empty() ? 0 : th[cur]->id;
+        if (busy_us.size() <= id) busy_us.resize(id + 1, 0.0);
+        busy_us[id] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - slice_start).count();
+        slice_start = std::chrono::steady_clock::now();
+    }
     bool main_active = false;
     gaddr thread_exit_stub = 0;
 
@@ -267,8 +278,8 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         }
         return false;
     }
-    void save(GThread& t) { save_ctx(t.ctx); }
-    void load(GThread& t) { load_ctx(t.ctx); }
+    void save(GThread& t) { slice_end(); save_ctx(t.ctx); }   // (cur is still the thread being switched out)
+    void load(GThread& t) { load_ctx(t.ctx); slice_start = std::chrono::steady_clock::now(); }
     void apply_ret0(GThread& t) { if (t.has_ret0) { ret(t.ret0); t.has_ret0 = false; } }
     // The wait ended: take the mutex, store a join result, and make the blocking call return `r0`.
     void finish_wait(GThread& t, uint32_t r0) {
@@ -362,7 +373,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
             for (size_t j = 1; j < th.size(); j++) if (th[j]->st != Done && ready(*th[j])) { w = j; break; }
             if (!w) break;
             cur = w; load(*th[w]); finish_wait(*th[w], 0); apply_ret0(*th[w]);
-            depth++; run(); depth--;
+            slice_begin(); depth++; run(); depth--; slice_end();
         }
         cur = 0;
         load_ctx(host_ctx);
@@ -1160,6 +1171,10 @@ Guest::Guest(bool a64) {
 }
 
 Guest::~Guest() {
+    if (impl_->stats) {   // MPC_HOST_STATS=1
+        double total = 0; for (double us : impl_->busy_us) total += us;
+        for (size_t id = 0; id < impl_->busy_us.size(); id++) if (impl_->busy_us[id] > 0) std::fprintf(stderr, "stats: guest thread t%zu ran %.0f ms (%.0f%%)\n", id, impl_->busy_us[id] / 1000, 100 * impl_->busy_us[id] / total);
+    }
     delete impl_;
     munmap(mem_, kSpace);
 }
@@ -1197,7 +1212,9 @@ uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vec
         for (size_t k = 0; k < floats.size() && k < 8; k++) { uint32_t u; std::memcpy(&u, &floats[k], 4); J.SetVector(k, {u, 0}); }
         J.SetSP(sp); J.SetRegister(30, kData - 8); J.SetPC(fn);
         i.call_no++; i.cur = 0; i.main_active = true;
+        i.slice_begin();
         i.depth++; i.run(); i.depth--;
+        i.slice_end();
         i.main_active = false;
         const uint64_t x0 = J.GetRegister(0); const auto v0 = J.GetVector(0);   // the result: x0, or v0 for a float/double
         i.drain();
@@ -1219,9 +1236,11 @@ uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vec
     R[15] = fn & ~1u;
     i.jit->SetCpsr(0x10 | ((fn & 1) ? 0x20 : 0));   // user mode, Thumb if bit 0
     i.call_no++; i.cur = 0; i.main_active = true;
+    i.slice_begin();
     i.depth++;
     i.jit->Run();
     i.jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+    i.slice_end();
     i.depth--;
     i.main_active = false;
     const uint32_t r0 = R[0];
