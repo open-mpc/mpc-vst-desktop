@@ -14,9 +14,10 @@ if [ ! -d "$DYN/.git" ]; then
   git -C "$DYN" checkout -q "$DYN_REV"
 fi
 git -C "$DYN" submodule update -q --init --depth 1 externals/fmt externals/mcl externals/xbyak externals/zydis externals/zycore externals/robin-map
-if [ ! -f "$DYN/build/src/dynarmic/libdynarmic.a" ]; then
+# A32 runs armv7 (Gen1) plugins, A64 the aarch64 (Gen2) ones; a build made with A32 only is redone
+if [ ! -f "$DYN/build/src/dynarmic/libdynarmic.a" ] || ! grep -q 'DYNARMIC_FRONTENDS:STRING=A32;A64' "$DYN/build/CMakeCache.txt"; then
   cmake -S "$DYN" -B "$DYN/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DDYNARMIC_TESTS=OFF -DDYNARMIC_USE_BUNDLED_EXTERNALS=ON \
-        -DDYNARMIC_WARNINGS_AS_ERRORS=OFF -DDYNARMIC_FRONTENDS=A32 >/dev/null
+        -DDYNARMIC_WARNINGS_AS_ERRORS=OFF "-DDYNARMIC_FRONTENDS=A32;A64" >/dev/null
   ninja -C "$DYN/build" >/dev/null
 fi
 B=$DYN/build

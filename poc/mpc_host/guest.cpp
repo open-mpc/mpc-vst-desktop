@@ -4,6 +4,8 @@
 
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/A32/config.h>
+#include <dynarmic/interface/A64/a64.h>
+#include <dynarmic/interface/A64/config.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 
 #include <cctype>
@@ -40,17 +42,23 @@ constexpr gaddr kLoad = 0x00100000;       // load bias of the first module; late
 constexpr gaddr kHeap = 0x10000000;
 constexpr gaddr kHeapEnd = 0xE0000000;
 constexpr gaddr kStackTop = 0xF0000000;   // 8 MB stack below this
-constexpr uint32_t kRetSvc = 0xFFFFFF;    // svc number of the "return to host" stub
+constexpr uint32_t kRetSvc = 0xFFFFFF;    // svc number of the "return to host" stub (A64: svc takes 16 bits, so kRetSvc64)
+constexpr uint32_t kRetSvc64 = 0xFFFF;
+constexpr gaddr kHeapEnd64 = 0x70000000;  // aarch64 guests keep every address below 2 GB: a 32-bit value sign-extended to 64 bits is still the same pointer
+constexpr gaddr kStackTop64 = 0x7FF00000;
 }  // namespace
 
 struct Impl;
 using Thunk = std::function<void(Guest::Impl&)>;
 
-struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
+struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCallbacks {
     Guest& g;
     uint8_t* m;
+    bool a64 = false;                        // aarch64 guest (jit64) instead of armhf (jit)
     Dynarmic::ExclusiveMonitor monitor{1};   // LDREX/STREX (one guest CPU)
     std::unique_ptr<Dynarmic::A32::Jit> jit;
+    std::unique_ptr<Dynarmic::A64::Jit> jit64;
+    uint64_t tpidr_el0 = 0;                  // the aarch64 thread pointer (TPIDR_EL0) is read from here
     std::vector<Thunk> thunks;               // index = svc number
     std::vector<std::string> thunk_names;
     std::unordered_map<std::string, gaddr> dynsyms;
@@ -94,7 +102,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     std::unordered_map<gaddr, uint32_t> sizes;
     int depth = 0;
 
-    explicit Impl(Guest& g_) : g(g_), m(g_.mem_) {}
+    Impl(Guest& g_, bool a64_) : a64(a64_), g(g_), m(g_.mem_) {}
 
     // --- dynarmic callbacks (fastmem covers almost everything; these are the slow path) ---
     template <class T> T rd(uint32_t a) { T v; std::memcpy(&v, m + a, sizeof v); return v; }
@@ -111,6 +119,30 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     bool MemoryWriteExclusive16(uint32_t a, uint16_t v, uint16_t) override { wr(a, v); return true; }
     bool MemoryWriteExclusive32(uint32_t a, uint32_t v, uint32_t) override { wr(a, v); return true; }
     bool MemoryWriteExclusive64(uint32_t a, uint64_t v, uint64_t) override { wr(a, v); return true; }
+    // aarch64 (the same slow paths with 64-bit addresses; every guest address is below 4 GB)
+    uint8_t MemoryRead8(uint64_t a) override { return rd<uint8_t>((uint32_t)a); }
+    uint16_t MemoryRead16(uint64_t a) override { return rd<uint16_t>((uint32_t)a); }
+    uint32_t MemoryRead32(uint64_t a) override { return rd<uint32_t>((uint32_t)a); }
+    uint64_t MemoryRead64(uint64_t a) override { return rd<uint64_t>((uint32_t)a); }
+    Dynarmic::A64::Vector MemoryRead128(uint64_t a) override { return {rd<uint64_t>((uint32_t)a), rd<uint64_t>((uint32_t)a + 8)}; }
+    void MemoryWrite8(uint64_t a, uint8_t v) override { wr((uint32_t)a, v); }
+    void MemoryWrite16(uint64_t a, uint16_t v) override { wr((uint32_t)a, v); }
+    void MemoryWrite32(uint64_t a, uint32_t v) override { wr((uint32_t)a, v); }
+    void MemoryWrite64(uint64_t a, uint64_t v) override { wr((uint32_t)a, v); }
+    void MemoryWrite128(uint64_t a, Dynarmic::A64::Vector v) override { wr((uint32_t)a, v[0]); wr((uint32_t)a + 8, v[1]); }
+    bool MemoryWriteExclusive8(uint64_t a, uint8_t v, uint8_t) override { wr((uint32_t)a, v); return true; }
+    bool MemoryWriteExclusive16(uint64_t a, uint16_t v, uint16_t) override { wr((uint32_t)a, v); return true; }
+    bool MemoryWriteExclusive32(uint64_t a, uint32_t v, uint32_t) override { wr((uint32_t)a, v); return true; }
+    bool MemoryWriteExclusive64(uint64_t a, uint64_t v, uint64_t) override { wr((uint32_t)a, v); return true; }
+    bool MemoryWriteExclusive128(uint64_t a, Dynarmic::A64::Vector v, Dynarmic::A64::Vector) override { wr((uint32_t)a, v[0]); wr((uint32_t)a + 8, v[1]); return true; }
+    void InterpreterFallback(uint64_t pc, size_t) override { std::fprintf(stderr, "guest: interpreter fallback at %08llx\n", (unsigned long long)pc); std::abort(); }
+    void ExceptionRaised(uint64_t pc, Dynarmic::A64::Exception e) override {
+        using E = Dynarmic::A64::Exception;
+        if (e == E::Yield || e == E::SendEvent || e == E::SendEventLocal || e == E::WaitForEvent || e == E::WaitForInterrupt) return;   // hints
+        std::fprintf(stderr, "guest: exception %d at %08llx\n", (int)e, (unsigned long long)pc);
+        std::abort();
+    }
+    uint64_t GetCNTPCT() override { return 0; }
     void InterpreterFallback(uint32_t pc, size_t) override { std::fprintf(stderr, "guest: interpreter fallback at %08x\n", pc); std::abort(); }
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception e) override {
         using E = Dynarmic::A32::Exception;
@@ -122,7 +154,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     void AddTicks(uint64_t) override {}
     uint64_t GetTicksRemaining() override { return 1ull << 40; }
     void CallSVC(uint32_t n) override {
-        if (n == kRetSvc) { jit->HaltExecution(); return; }
+        if (n == (a64 ? kRetSvc64 : kRetSvc)) { if (a64) jit64->HaltExecution(); else jit->HaltExecution(); return; }
         if (n >= thunks.size()) { std::fprintf(stderr, "guest: bad svc %u\n", n); std::abort(); }
         static const bool trace = std::getenv("MPC_HOST_TRACE") != nullptr;   // every thunk call, with the guest thread
         if (trace) std::fprintf(stderr, "[t%u] %s(%x,%x,%x)\n", th.empty() ? 0 : th[cur]->id, thunk_names[n].c_str(), r(0), r(1), r(2));
@@ -134,9 +166,24 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     // blocks resumes at the `bx lr` after its own svc. A new thread runs first, until it blocks or exits. Threads run only inside a
     // host call(); when the call returns, the runnable workers are drained once (drain()). Sleeping workers wake on the next call.
     enum St { Run, WaitMutex, WaitCond, WaitJoin, Sleep, Done };
+    struct Ctx {   // a CPU register file: armhf r0-r15 + s0-s63 + CPSR/FPSCR, or aarch64 x0-x30, sp, pc, v0-v31, PSTATE/FPCR/FPSR
+        std::array<uint32_t, 16> r{}; std::array<uint32_t, 64> ext{}; uint32_t cpsr = 0x10, fpscr = 0;
+        std::array<uint64_t, 31> x{}; uint64_t sp = 0, pc = 0; std::array<Dynarmic::A64::Vector, 32> v{}; uint32_t pstate = 0, fpcr = 0, fpsr = 0;
+    };
+    void save_ctx(Ctx& c) {
+        if (!a64) { c.r = jit->Regs(); c.ext = jit->ExtRegs(); c.cpsr = jit->Cpsr(); c.fpscr = jit->Fpscr(); return; }
+        c.x = jit64->GetRegisters(); c.sp = jit64->GetSP(); c.pc = jit64->GetPC(); c.v = jit64->GetVectors();
+        c.pstate = jit64->GetPstate(); c.fpcr = jit64->GetFpcr(); c.fpsr = jit64->GetFpsr();
+    }
+    void load_ctx(const Ctx& c) {
+        if (!a64) { jit->Regs() = c.r; jit->ExtRegs() = c.ext; jit->SetCpsr(c.cpsr); jit->SetFpscr(c.fpscr); jit->ClearExclusiveState(); return; }
+        jit64->SetRegisters(c.x); jit64->SetSP(c.sp); jit64->SetPC(c.pc); jit64->SetVectors(c.v);
+        jit64->SetPstate(c.pstate); jit64->SetFpcr(c.fpcr); jit64->SetFpsr(c.fpsr); jit64->ClearExclusiveState();
+    }
     struct GThread {
         uint32_t id = 0; St st = Run;
-        std::array<uint32_t, 16> regs{}; std::array<uint32_t, 64> ext{}; uint32_t cpsr = 0x10, fpscr = 0;
+        Ctx ctx;
+        uint32_t ret0 = 0; bool has_ret0 = false;   // the value the blocking call returns when the thread resumes
         gaddr obj = 0, mtx = 0, join_ret = 0;   // what it waits on, the mutex to take again after a cond wait, where join stores the result
         bool signaled = false, timed = false;
         uint32_t retval = 0, sleep_call = 0;
@@ -149,11 +196,12 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
 
     GThread& me() { return *th[cur]; }
     // mutex layout (glibc armhf): count at +4, owner at +8, kind at +12 (1 = recursive)
+    uint32_t kind_off() const { return a64 ? 16 : 12; }   // glibc aarch64: lock +0, count +4, owner +8, nusers +12, kind +16
     bool mutex_free(gaddr mu) { return rd<uint32_t>(mu + 8) == 0; }
     bool try_lock(gaddr mu, uint32_t tid) {
         const uint32_t owner = rd<uint32_t>(mu + 8);
         if (owner == 0) { wr<uint32_t>(mu + 8, tid); wr<uint32_t>(mu + 4, 1); return true; }
-        if (owner == tid && rd<uint32_t>(mu + 12) == 1) { wr<uint32_t>(mu + 4, rd<uint32_t>(mu + 4) + 1); return true; }
+        if (owner == tid && rd<uint32_t>(mu + kind_off()) == 1) { wr<uint32_t>(mu + 4, rd<uint32_t>(mu + 4) + 1); return true; }
         return false;
     }
     void unlock(gaddr mu) {
@@ -164,7 +212,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     bool ready(GThread& t) {
         switch (t.st) {
         case Run: return true;
-        case WaitMutex: return mutex_free(t.obj) || (rd<uint32_t>(t.obj + 12) == 1 && rd<uint32_t>(t.obj + 8) == t.id);
+        case WaitMutex: return mutex_free(t.obj) || (rd<uint32_t>(t.obj + kind_off()) == 1 && rd<uint32_t>(t.obj + 8) == t.id);
         case WaitCond: return t.signaled && mutex_free(t.mtx);
         case WaitJoin: return th[t.obj - 1]->st == Done;
         case Sleep: return call_no > t.sleep_call;
@@ -172,8 +220,9 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         }
         return false;
     }
-    void save(GThread& t) { t.regs = jit->Regs(); t.ext = jit->ExtRegs(); t.cpsr = jit->Cpsr(); t.fpscr = jit->Fpscr(); }
-    void load(GThread& t) { jit->Regs() = t.regs; jit->ExtRegs() = t.ext; jit->SetCpsr(t.cpsr); jit->SetFpscr(t.fpscr); jit->ClearExclusiveState(); }
+    void save(GThread& t) { save_ctx(t.ctx); }
+    void load(GThread& t) { load_ctx(t.ctx); }
+    void apply_ret0(GThread& t) { if (t.has_ret0) { ret(t.ret0); t.has_ret0 = false; } }
     // The wait ended: take the mutex, store a join result, and make the blocking call return `r0`.
     void finish_wait(GThread& t, uint32_t r0) {
         switch (t.st) {
@@ -182,7 +231,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         case WaitJoin: if (t.join_ret) wr<uint32_t>(t.join_ret, th[t.obj - 1]->retval); break;
         default: break;
         }
-        if (t.st != Run) t.regs[0] = r0;
+        if (t.st != Run) { t.ret0 = r0; t.has_ret0 = true; }
         t.st = Run; t.signaled = false;
     }
     // Picks the next thread after the current one (round robin), switches to it and returns true; false if none could run.
@@ -197,7 +246,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
                 if (t.st == Done || !ready(t)) continue;
                 if (j != cur) { save(me()); cur = j; load(t); }
                 finish_wait(t, 0);
-                if (j != cur || true) jit->Regs()[0] = t.regs[0];
+                apply_ret0(t);
                 return true;
             }
             bool sleepers = false;   // time passes only while the main thread waits inside a call; in drain() a sleeper waits for the next call
@@ -210,6 +259,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
             if (t.st == WaitMutex || (t.st == WaitCond && !mutex_free(t.mtx))) { std::fprintf(stderr, "guest: deadlock (main thread waits on a held mutex)\n"); std::abort(); }
             if (cur != 0) { save(me()); cur = 0; load(t); }
             finish_wait(t, t.timed ? 110 : 0);
+            apply_ret0(t);
             return true;
         }
         return false;
@@ -218,7 +268,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     void block(St st, gaddr obj) {
         GThread& t = me();
         t.st = st; t.obj = obj; t.sleep_call = call_no;
-        if (!schedule()) { save(t); jit->HaltExecution(); }   // a worker with nothing to do: back to the host
+        if (!schedule()) { save(t); halt(); }   // a worker with nothing to do: back to the host
     }
     void yield() {
         if (th.size() < 2) return;
@@ -227,7 +277,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         for (size_t k = 1; k < th.size(); k++) {
             const size_t j = (before + k) % th.size();
             if ((j == 0 && !main_active) || th[j]->st == Done || !ready(*th[j])) continue;
-            save(t); cur = j; load(*th[j]); finish_wait(*th[j], 0); jit->Regs()[0] = th[j]->regs[0] = (th[j]->regs[0]);
+            save(t); cur = j; load(*th[j]); finish_wait(*th[j], 0); apply_ret0(*th[j]);
             return;
         }
     }
@@ -235,52 +285,70 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         auto t = std::make_unique<GThread>();
         t->id = (uint32_t)th.size() + 1;
         const gaddr stack = malloc_(512 * 1024);
-        t->regs[0] = arg; t->regs[13] = (stack + 512 * 1024 - 16) & ~7u; t->regs[14] = thread_exit_stub; t->regs[15] = fn & ~1u;
-        t->cpsr = 0x10 | ((fn & 1) ? 0x20 : 0);
+        if (!a64) {
+            t->ctx.r[0] = arg; t->ctx.r[13] = (stack + 512 * 1024 - 16) & ~7u; t->ctx.r[14] = thread_exit_stub; t->ctx.r[15] = fn & ~1u;
+            t->ctx.cpsr = 0x10 | ((fn & 1) ? 0x20 : 0);
+        } else {
+            t->ctx.x[0] = arg; t->ctx.sp = (stack + 512 * 1024 - 16) & ~15u; t->ctx.x[30] = thread_exit_stub; t->ctx.pc = fn;
+        }
         const uint32_t id = t->id;
         th.push_back(std::move(t));
         // child first: the parent stays runnable and gets 0 back from pthread_create when the child blocks or exits
-        jit->Regs()[0] = 0;
+        ret(0);
         save(me()); cur = th.size() - 1; load(*th.back());
         return id;
     }
     void exit_thread(uint32_t retval) {
         GThread& t = me(); t.st = Done; t.retval = retval;
-        if (!schedule()) { jit->HaltExecution(); }
+        if (!schedule()) { halt(); }
     }
     // After a host call returns: let workers that can run do so once. Registers the host call needs are put back.
     void drain() {
         if (th.size() < 2) return;
-        const auto R = jit->Regs(); const auto E = jit->ExtRegs(); const uint32_t cpsr = jit->Cpsr(), fpscr = jit->Fpscr();
+        Ctx host_ctx; save_ctx(host_ctx);
         switches = 0;
         for (int round = 0; round < 1000; round++) {
             size_t w = 0;
             for (size_t j = 1; j < th.size(); j++) if (th[j]->st != Done && ready(*th[j])) { w = j; break; }
             if (!w) break;
-            cur = w; load(*th[w]); finish_wait(*th[w], 0); jit->Regs()[0] = th[w]->regs[0];
-            depth++; jit->Run(); jit->ClearHalt(Dynarmic::HaltReason::UserDefined1); depth--;
+            cur = w; load(*th[w]); finish_wait(*th[w], 0); apply_ret0(*th[w]);
+            depth++; run(); depth--;
         }
         cur = 0;
-        jit->Regs() = R; jit->ExtRegs() = E; jit->SetCpsr(cpsr); jit->SetFpscr(fpscr);
+        load_ctx(host_ctx);
     }
 
-    // --- argument access (armhf AAPCS) ---
-    uint32_t& r(int i) { return jit->Regs()[i]; }
-    uint32_t arg(int i) { return i < 4 ? r(i) : rd<uint32_t>(r(13) + 4 * (i - 4)); }
-    float s(int i) { float f; std::memcpy(&f, &jit->ExtRegs()[i], 4); return f; }
-    double d(int i) { uint64_t u = jit->ExtRegs()[2 * i] | (uint64_t)jit->ExtRegs()[2 * i + 1] << 32; double v; std::memcpy(&v, &u, 8); return v; }
-    void ret(uint32_t v) { r(0) = v; }
-    void ret64(uint64_t v) { r(0) = (uint32_t)v; r(1) = (uint32_t)(v >> 32); }
-    void ret_f(float f) { std::memcpy(&jit->ExtRegs()[0], &f, 4); }
-    void ret_d(double v) { uint64_t u; std::memcpy(&u, &v, 8); jit->ExtRegs()[0] = (uint32_t)u; jit->ExtRegs()[1] = (uint32_t)(u >> 32); }
+    // --- argument access: armhf AAPCS (r0-r3, then the stack; floats in VFP registers) or aarch64 AAPCS64 (x0-x7; floats in v0-v7).
+    // Thunks use the armhf names: r(0..3) are the first arguments, r(13) the stack pointer, r(14) the link register; on aarch64 they read x0-x7, sp, x30.
+    // An aarch64 guest keeps all addresses below 2 GB, so a 32-bit value is a whole pointer, and a sign-extended int return is also a correct long/pointer.
+    void halt() { if (a64) jit64->HaltExecution(); else jit->HaltExecution(); }
+    void run() { if (a64) { jit64->Run(); jit64->ClearHalt(Dynarmic::HaltReason::UserDefined1); } else { jit->Run(); jit->ClearHalt(Dynarmic::HaltReason::UserDefined1); } }
+    uint32_t r(int i) {
+        if (!a64) return jit->Regs()[i];
+        return (uint32_t)(i == 13 ? jit64->GetSP() : jit64->GetRegister(i == 14 ? 30 : i));
+    }
+    uint64_t x(int i) { return jit64->GetRegister(i); }   // a full 64-bit argument (aarch64)
+    uint32_t arg(int i) {
+        if (a64) return i < 8 ? r(i) : rd<uint32_t>((uint32_t)jit64->GetSP() + 8 * (i - 8));
+        return i < 4 ? r(i) : rd<uint32_t>(r(13) + 4 * (i - 4));
+    }
+    float s(int i) { float f; if (a64) { const uint64_t u = jit64->GetVector(i)[0]; std::memcpy(&f, &u, 4); } else std::memcpy(&f, &jit->ExtRegs()[i], 4); return f; }
+    double d(int i) {
+        uint64_t u = a64 ? jit64->GetVector(i)[0] : (jit->ExtRegs()[2 * i] | (uint64_t)jit->ExtRegs()[2 * i + 1] << 32);
+        double v; std::memcpy(&v, &u, 8); return v;
+    }
+    void ret(uint32_t v) { if (a64) jit64->SetRegister(0, (uint64_t)(int64_t)(int32_t)v); else jit->Regs()[0] = v; }
+    void ret64(uint64_t v) { if (a64) jit64->SetRegister(0, v); else { jit->Regs()[0] = (uint32_t)v; jit->Regs()[1] = (uint32_t)(v >> 32); } }
+    void ret_f(float f) { uint32_t u; std::memcpy(&u, &f, 4); if (a64) jit64->SetVector(0, {u, 0}); else jit->ExtRegs()[0] = u; }
+    void ret_d(double v) { uint64_t u; std::memcpy(&u, &v, 8); if (a64) jit64->SetVector(0, {u, 0}); else { jit->ExtRegs()[0] = (uint32_t)u; jit->ExtRegs()[1] = (uint32_t)(u >> 32); } }
     char* str(gaddr a) { return reinterpret_cast<char*>(m + a); }
 
     gaddr add_thunk(const std::string& name, Thunk t) {
         const uint32_t n = (uint32_t)thunks.size();
         const gaddr at = kThunks + 8 * n;
         if (at + 8 > kData) { std::fprintf(stderr, "guest: thunk page full\n"); std::abort(); }
-        wr<uint32_t>(at, 0xEF000000u | n);   // svc #n
-        wr<uint32_t>(at + 4, 0xE12FFF1Eu);   // bx lr
+        if (a64) { wr<uint32_t>(at, 0xD4000001u | (n << 5)); wr<uint32_t>(at + 4, 0xD65F03C0u); }   // svc #n; ret
+        else { wr<uint32_t>(at, 0xEF000000u | n); wr<uint32_t>(at + 4, 0xE12FFF1Eu); }              // svc #n; bx lr
         thunks.push_back(std::move(t));
         thunk_names.push_back(name);
         return at;
@@ -310,7 +378,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         gaddr p;
         if (!fl.empty()) { p = fl.back(); fl.pop_back(); }
         else {
-            if (heap_next + c > kHeapEnd) return 0;
+            if (heap_next + c > (a64 ? kHeapEnd64 : kHeapEnd)) return 0;
             p = heap_next; heap_next += c;
         }
         sizes[p] = c;
@@ -842,20 +910,38 @@ std::vector<Entry> libc_table() {
 bool is_data_import(const std::string& n) { return n == "__stack_chk_guard" || n == "_ZSt7nothrow" || n == "stderr" || n == "stdout"; }
 }  // namespace
 
-Guest::Guest() {
+Guest::Guest(bool a64) {
     void* p = mmap(nullptr, kSpace, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) { std::perror("mmap 4 GB"); std::abort(); }
     mem_ = static_cast<uint8_t*>(p);
-    impl_ = new Impl(*this);
+    impl_ = new Impl(*this, a64);
     // index 0: a trap at guest address 0 (a call through a null pointer, e.g. an unresolved weak import)
     impl_->add_thunk("<null>", [](I& i) { std::fprintf(stderr, "guest: call to address 0 from lr=%08x\n", i.r(14)); std::abort(); });
-    impl_->wr<uint32_t>(0, 0xEF000000u);   // svc #0 at address 0
+    impl_->wr<uint32_t>(0, a64 ? 0xD4000001u : 0xEF000000u);   // svc #0 at address 0
     impl_->th.push_back(std::make_unique<Guest::Impl::GThread>());
     impl_->th[0]->id = 1;
     impl_->thread_exit_stub = impl_->add_thunk("<thread exit>", [](I& i) { i.exit_thread(i.r(0)); });
     const gaddr ret = kData - 8;
-    impl_->wr<uint32_t>(ret, 0xEF000000u | kRetSvc);
+    impl_->wr<uint32_t>(ret, a64 ? (0xD4000001u | (kRetSvc64 << 5)) : (0xEF000000u | kRetSvc));
 
+    if (a64) {
+        Dynarmic::A64::UserConfig cfg;
+        cfg.callbacks = impl_;
+        cfg.global_monitor = &impl_->monitor;
+        cfg.fastmem_pointer = reinterpret_cast<uintptr_t>(mem_);
+        cfg.fastmem_address_space_bits = 32;        // the guest uses the low 2 GB of its 4 GB arena
+        cfg.silently_mirror_fastmem = true;
+        cfg.tpidr_el0 = &impl_->tpidr_el0;
+        cfg.enable_cycle_counting = false;
+        if (std::getenv("MPC_HOST_UNSAFE")) {
+            cfg.unsafe_optimizations = true;
+            cfg.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+                                 Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN | Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+        }
+        impl_->tpidr_el0 = kTp;
+        impl_->jit64 = std::make_unique<Dynarmic::A64::Jit>(cfg);
+        return;
+    }
     Dynarmic::A32::UserConfig cfg;
     cfg.callbacks = impl_;
     cfg.global_monitor = &impl_->monitor;
@@ -875,6 +961,7 @@ Guest::~Guest() {
     munmap(mem_, kSpace);
 }
 
+bool Guest::is64() const { return impl_->a64; }
 uint32_t Guest::rd32(gaddr a) const { return impl_->rd<uint32_t>(a); }
 void Guest::wr32(gaddr a, uint32_t v) { impl_->wr<uint32_t>(a, v); }
 gaddr Guest::alloc(uint32_t n) { return impl_->malloc_(n); }
@@ -888,7 +975,7 @@ gaddr Guest::symbol(const char* name) const {
 
 gaddr Guest::host_callback(HostCallback fn) {
     return impl_->add_thunk("<host callback>", [fn](I& i) {
-        float opt; std::memcpy(&opt, &i.jit->ExtRegs()[0], 4);
+        const float opt = i.s(0);
         i.ret(fn(i.g, i.r(0), (int32_t)i.r(1), (int32_t)i.r(2), (int32_t)i.r(3), i.arg(4), opt));
     });
 }
@@ -896,6 +983,25 @@ gaddr Guest::host_callback(HostCallback fn) {
 uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vector<float>& floats) {
     I& i = *impl_;
     if (i.depth) { std::fprintf(stderr, "guest: nested call from a thunk (not supported)\n"); std::abort(); }
+    if (i.a64) {   // AAPCS64: integer arguments in x0-x7 (then 8-byte stack slots), floats in v0-v7
+        auto& J = *i.jit64;
+        Guest::Impl::Ctx saved; i.save_ctx(saved);
+        uint64_t sp = saved.sp ? saved.sp : kStackTop64;
+        const size_t nstack = ints.size() > 8 ? ints.size() - 8 : 0;
+        sp -= 8 * nstack; sp &= ~15ull;
+        for (size_t k = 0; k < nstack; k++) i.wr<uint64_t>((uint32_t)sp + 8 * (uint32_t)k, ints[8 + k]);
+        for (size_t k = 0; k < 8 && k < ints.size(); k++) J.SetRegister(k, ints[k]);
+        for (size_t k = 0; k < floats.size() && k < 8; k++) { uint32_t u; std::memcpy(&u, &floats[k], 4); J.SetVector(k, {u, 0}); }
+        J.SetSP(sp); J.SetRegister(30, kData - 8); J.SetPC(fn);
+        i.call_no++; i.cur = 0; i.main_active = true;
+        i.depth++; i.run(); i.depth--;
+        i.main_active = false;
+        const uint64_t x0 = J.GetRegister(0); const auto v0 = J.GetVector(0);   // the result: x0, or v0 for a float/double
+        i.drain();
+        i.load_ctx(saved);
+        J.SetRegister(0, x0); J.SetVector(0, v0);
+        return (uint32_t)x0;
+    }
     auto& R = i.jit->Regs();
     const auto saved = R;
     uint32_t sp = R[13] ? R[13] : kStackTop;
