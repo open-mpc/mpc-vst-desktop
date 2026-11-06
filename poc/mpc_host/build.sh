@@ -24,8 +24,12 @@ B=$DYN/build
 LIBS=$(find "$B" -name '*.a' | grep -v libdynarmic.a | tr '\n' ' ')
 g++ -std=c++20 -O2 -g -Wall -I"$DYN/src" -I"$DYN/externals/mcl/include" "$HERE/guest.cpp" "$HERE/main.cpp" \
     "$B/src/dynarmic/libdynarmic.a" $LIBS $LIBS -ldl -o "$OUT/mpc_host"
-# guest-code libc helpers (qsort, bsearch): needs the armhf cross compiler; mpc_host loads $OUT/guest_helpers.so when it is there
+# guest-code libc helpers (qsort, bsearch): need the armhf (and for aarch64 guests the aarch64) cross compiler; mpc_host loads $OUT/guest_helpers.so (guest_helpers64.so) when it is there
 if command -v arm-linux-gnueabihf-gcc >/dev/null; then
   arm-linux-gnueabihf-gcc -O2 -fPIC -shared -nostdlib -fno-builtin -o "$OUT/guest_helpers.so" "$HERE/guest_helpers.c"
+fi
+A64_CC=${A64_CC:-aarch64-linux-gnu-gcc}   # the same helpers for aarch64 guests
+if command -v "$A64_CC" >/dev/null; then
+  "$A64_CC" -O2 -fPIC -shared -nostdlib -fno-builtin -o "$OUT/guest_helpers64.so" "$HERE/guest_helpers.c"
 fi
 echo "built $OUT/mpc_host"

@@ -138,7 +138,46 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     bool MemoryWriteExclusive32(uint64_t a, uint32_t v, uint32_t) override { wr((uint32_t)a, v); return true; }
     bool MemoryWriteExclusive64(uint64_t a, uint64_t v, uint64_t) override { wr((uint32_t)a, v); return true; }
     bool MemoryWriteExclusive128(uint64_t a, Dynarmic::A64::Vector v, Dynarmic::A64::Vector) override { wr((uint32_t)a, v[0]); wr((uint32_t)a + 8, v[1]); return true; }
-    void InterpreterFallback(uint64_t pc, size_t) override { std::fprintf(stderr, "guest: interpreter fallback at %08llx\n", (unsigned long long)pc); std::abort(); }
+    // dynarmic's A64 front end lacks some ARMv8.1/8.3 instructions that newer compilers emit (LSE atomics, LDAPR). With one guest CPU running one
+    // thread at a time they are plain loads and stores, so they are emulated here and execution continues at the next instruction.
+    bool emulate_a64(uint64_t pc) {
+        const uint32_t w = rd<uint32_t>((uint32_t)pc);
+        auto reg = [&](int n) -> uint64_t { return n == 31 ? 0 : jit64->GetRegister(n); };
+        auto setreg = [&](int n, uint64_t v) { if (n != 31) jit64->SetRegister(n, v); };
+        const int size = (int)(w >> 30), bytes = 1 << size, rn = (w >> 5) & 31, rt = w & 31, rs = (w >> 16) & 31;
+        const uint64_t mask = bytes == 8 ? ~0ull : (1ull << (bytes * 8)) - 1;
+        const uint32_t addr = (uint32_t)(rn == 31 ? jit64->GetSP() : jit64->GetRegister(rn));
+        auto load = [&]() { uint64_t v = 0; std::memcpy(&v, m + addr, bytes); return v; };
+        auto store = [&](uint64_t v) { std::memcpy(m + addr, &v, bytes); };
+        auto sext = [&](uint64_t v) { return bytes == 8 ? (int64_t)v : (int64_t)(v << (64 - bytes * 8)) >> (64 - bytes * 8); };
+        if ((w & 0x3FFFFC00) == 0x38BFC000) { setreg(rt, load()); jit64->SetPC(pc + 4); return true; }                         // LDAPR{B,H,}: a load-acquire is stronger
+        if ((w & 0x3F200C00) == 0x38200000) {                                                                                  // atomic memory operations
+            const int o3 = (w >> 15) & 1, opc = (w >> 12) & 7; const uint64_t old = load(), v = reg(rs) & mask; uint64_t nv;
+            if (o3 && opc == 0) nv = v;                                              // SWP
+            else if (o3) return false;
+            else switch (opc) {
+                case 0: nv = old + v; break;                                         // LDADD
+                case 1: nv = old & ~v; break;                                        // LDCLR
+                case 2: nv = old ^ v; break;                                         // LDEOR
+                case 3: nv = old | v; break;                                         // LDSET
+                case 4: nv = sext(old) > sext(v) ? old : v; break;                   // LDSMAX
+                case 5: nv = sext(old) < sext(v) ? old : v; break;                   // LDSMIN
+                case 6: nv = old > v ? old : v; break;                               // LDUMAX
+                default: nv = old < v ? old : v; break;                              // LDUMIN
+            }
+            store(nv & mask); setreg(rt, old); jit64->SetPC(pc + 4); return true;     // Rt = xzr is the ST* form: the old value is dropped
+        }
+        if ((w & 0x3FA07C00) == 0x08A07C00) {                                        // CAS{A,L}{B,H,}: compare Rs with memory, store Rt if equal, Rs = old
+            const uint64_t old = load();
+            if (old == (reg(rs) & mask)) store(reg(rt) & mask);
+            setreg(rs, old); jit64->SetPC(pc + 4); return true;
+        }
+        return false;
+    }
+    void InterpreterFallback(uint64_t pc, size_t n) override {
+        if (n == 1 && emulate_a64(pc)) return;
+        std::fprintf(stderr, "guest: interpreter fallback at %08llx (instruction %08x)\n", (unsigned long long)pc, rd<uint32_t>((uint32_t)pc)); std::abort();
+    }
     void ExceptionRaised(uint64_t pc, Dynarmic::A64::Exception e) override {
         using E = Dynarmic::A64::Exception;
         if (e == E::Yield || e == E::SendEvent || e == E::SendEventLocal || e == E::WaitForEvent || e == E::WaitForInterrupt) return;   // hints
@@ -513,6 +552,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         }
         return n;
     }
+    VarArgs va_list_args(uint32_t ap) { return a64 ? VarArgs{*this, 8, 0, 0, ap} : VarArgs{*this, 4, ap}; }   // a va_list is one pointer on armhf, a 32-byte structure passed by reference on aarch64
     void put(gaddr buf, uint32_t n, const std::string& s) {
         if (n) { const size_t k = std::min<size_t>(s.size(), n - 1); std::memcpy(m + buf, s.data(), k); m[buf + k] = 0; }
         ret((uint32_t)s.size());
@@ -655,7 +695,7 @@ std::vector<Entry> libc_table() {
     add("__errno_location", [](I& i) { if (!i.errno_p) i.errno_p = i.data(4, 4); i.ret(i.errno_p); });
     add("strerror", [](I& i) { i.ret(i.cstr("error")); });
     add("__assert_fail", [](I& i) { std::fprintf(stderr, "guest: assert %s at %s:%u\n", i.str(i.r(0)), i.str(i.r(1)), i.r(2)); std::abort(); });
-    add("syscall", [](I& i) { abort_named(i, "syscall"); });
+    add("syscall", [](I& i) { i.ret(i.fail(38)); });   // ENOSYS: no raw system calls (a plugin using them falls back or fails)
     for (const char* n : {"pthread_cond_destroy", "pthread_cond_init", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
                           "pthread_rwlock_unlock", "pthread_detach", "__cxa_thread_atexit_impl"})
         add(n, [](I& i) { i.ret(0); });   // one thread: nothing to wait for or wake
@@ -670,7 +710,16 @@ std::vector<Entry> libc_table() {
     add("ldexp", [](I& i) { i.ret_d(std::ldexp(i.d(0), (int)i.r(0))); });
     add("ldexpf", [](I& i) { i.ret_f(std::ldexp(i.s(0), (int)i.r(0))); });
     add("modf", [](I& i) { double ip; const double v = std::modf(i.d(0), &ip); std::memcpy(i.m + i.r(0), &ip, 8); i.ret_d(v); });
-    add("vsnprintf", [](I& i) { const gaddr b = i.r(0); const uint32_t n = i.r(1); i.put(b, n, i.format(i.str(i.r(2)), {i, 4, i.r(3)})); });   // armhf va_list = one pointer
+    add("vsnprintf", [](I& i) { const gaddr b = i.r(0); const uint32_t n = i.r(1); i.put(b, n, i.format(i.str(i.r(2)), i.va_list_args(i.r(3)))); });
+    add("vsprintf", [](I& i) { const std::string s = i.format(i.str(i.r(1)), i.va_list_args(i.r(2))); i.put(i.r(0), 0x7fffffff, s); });
+    add("__vsprintf_chk", [](I& i) { const std::string s = i.format(i.str(i.arg(3)), i.va_list_args(i.arg(4))); i.put(i.r(0), 0x7fffffff, s); });
+    add("__vsnprintf_chk", [](I& i) { const std::string s = i.format(i.str(i.arg(4)), i.va_list_args(i.arg(5))); i.put(i.r(0), i.r(1), s); });
+    auto vfprintf_out = [](I& i, gaddr file, const std::string& s) { if (FILE* f = i.file_of(file)) std::fputs(s.c_str(), f); else std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); };
+    add("vfprintf", [vfprintf_out](I& i) { vfprintf_out(i, i.r(0), i.format(i.str(i.r(1)), i.va_list_args(i.r(2)))); });
+    add("__vfprintf_chk", [vfprintf_out](I& i) { vfprintf_out(i, i.r(0), i.format(i.str(i.r(2)), i.va_list_args(i.r(3)))); });
+    add("vprintf", [](I& i) { const std::string s = i.format(i.str(i.r(0)), i.va_list_args(i.r(1))); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
+    add("__vprintf_chk", [](I& i) { const std::string s = i.format(i.str(i.r(1)), i.va_list_args(i.r(2))); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
+    add("signal", [](I& i) { i.ret(0); });   // SIG_DFL back: no signals are delivered to guests
     // wide characters: ASCII only (the "C" locale)
     add("wctob", [](I& i) { i.ret(i.r(0) < 128 ? i.r(0) : 0xFFFFFFFFu); });
     add("btowc", [](I& i) { i.ret(i.r(0) < 128 ? i.r(0) : 0xFFFFFFFFu); });
@@ -958,6 +1007,13 @@ std::vector<Entry> libc_table() {
             if (!c) { if (dst) i.wrp(src, 0); i.ret(n); return; }
         }
         i.wrp(src, s0 + n); i.ret(n); });
+    for (const char* n : {"setpriority", "getpriority", "nice", "setpgid", "sigaltstack", "sigemptyset", "sigaddset", "sigprocmask", "pthread_sigmask", "prctl"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"getuid", "geteuid", "getgid", "getegid"}) add(n, [](I& i) { i.ret(1000); });
+    add("uname", [](I& i) {   // struct utsname: six 65-byte fields
+        std::memset(i.m + i.r(0), 0, 6 * 65);
+        const char* v[5] = {"Linux", "mpc", "5.15.0", "#1", i.a64 ? "aarch64" : "armv7l"};
+        for (int k = 0; k < 5; k++) std::strcpy((char*)i.m + i.r(0) + 65 * k, v[k]);
+        i.ret(0); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); const uint32_t off = i.rd<uint32_t>(ti + (i.a64 ? 8 : 4)); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + off); });   // tls_index {module, offset}
     // C++ runtime

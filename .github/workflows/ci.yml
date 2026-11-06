@@ -35,7 +35,7 @@ jobs:
         with:
           submodules: true
       - name: Install
-        run: sudo apt-get update -q && sudo apt-get install -y -q libboost-dev ninja-build gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+        run: sudo apt-get update -q && sudo apt-get install -y -q libboost-dev ninja-build gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - uses: actions/cache@v4
         with:
           path: poc/mpc_host/build/dynarmic
@@ -50,3 +50,8 @@ jobs:
         run: poc/mpc_host/smoke.sh poc/mpc_host/filetest/vst.json
       - name: C++ exceptions, std::string and std::map on the guest libstdc++ emulated
         run: poc/mpc_host/smoke.sh poc/mpc_host/cxxtest/vst.json
+      - name: The same fixtures as aarch64 (A64) guests
+        run: |
+          for t in poc/mpc_host/statetest poc/mpc_host/threadtest poc/mpc_host/filetest poc/mpc_host/cxxtest; do
+            ARCH=aarch64 poc/mpc_host/smoke.sh $t/vst.json
+          done

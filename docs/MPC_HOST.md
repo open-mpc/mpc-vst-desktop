@@ -229,11 +229,43 @@ resumes at the `bx lr` after its own `svc`; no nested `Run()` is needed. Rules:
 - Not working: **cratedigger** returns no `AEffect` even with `/media/*/AddOns/ForceCrateDigger` created (it is a device add-on that runs `yt-dlp` and a shell);
   **rhythmbank** needs the ALSA sequencer; **clementine** (the non-XT build) needs `iswspace`; **machinedrum_one** is unresolved (see the survey).
 
+## aarch64 (Gen2) guests (2026-11-06, offline)
+
+`mpc_host` runs aarch64 plugins on dynarmic's A64 front end (`build.sh` builds both front ends). The driver reads the plugin's ELF class and builds `Guest(false)`
+(armhf) or `Guest(true)` (aarch64); there is no other switch. What differs from the armhf guest:
+- **Memory.** The guest still has a 4 GB arena (dynarmic fastmem, 32 address bits) but every address is below 2 GB (heap `0x10000000-0x70000000`, stack top `0x7FF00000`),
+  so a 32-bit value is a whole pointer and a sign-extended `int` return is also a correct `long` or pointer return. Pointers stored in guest memory are 8 bytes (`wrp`/`rdp`).
+- **Loader.** `load64`: ELF64, RELA relocations (`RELATIVE`, `GLOB_DAT`, `JUMP_SLOT`, `ABS64`), TLS variant 1 with a 16-byte TCB at `TPIDR_EL0 = 0x000C0000`
+  (`TLS_DTPMOD/DTPREL/TPREL`, `TLSDESC` with a two-instruction guest resolver, `__tls_get_addr`). `DT_RELR` is refused (not seen in any local build).
+- **Calls and threads.** AAPCS64 (x0-x7, v0-v7, 8-byte stack slots, 16-byte aligned sp); thread contexts hold x0-x30, sp, pc, v0-v31, PSTATE, FPCR, FPSR; `svc #n; ret` thunks (the
+  return stub uses `svc #0xFFFF`, since A64 `svc` has 16 bits).
+- **Varargs.** `printf`/`scanf` read integer arguments from x(n), doubles from v0-v7, then 8-byte stack slots; `v*printf` read the aarch64 `va_list` structure
+  (`stack`, `gr_top`, `vr_top`, `gr_offs`, `vr_offs`). `%ld`, `%zu`, `%jd` are 64-bit.
+- **Layouts.** `long`/`time_t` 64-bit (`time`, `gettimeofday`, `clock_gettime`), aarch64 `struct stat` (128 bytes), only the 64-bit `dirent`, pointer-sized `glob_t`, `Dl_info`,
+  `pthread_t`, `pthread_mutex_t` (48 bytes, kind at +16), `tls_index`.
+- **Unwinding.** The aarch64 unwinder asks `_dl_find_object(pc, &result)` for the module's `.eh_frame_hdr`; the host answers from `PT_GNU_EH_FRAME`.
+  Not done: `dl_iterate_phdr` (older libgcc), which needs a guest-code callback loop.
+- **Instructions dynarmic's A64 front end lacks.** Newer compilers emit LSE atomics (`SWP`, `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`LDSMAX`/`LDSMIN`/`LDUMAX`/`LDUMIN`, `CAS`)
+  and `LDAPR`. They arrive in `InterpreterFallback` and are emulated there as plain loads and stores (one guest CPU, one thread at a time), then execution continues. Other missing
+  instructions still stop with the instruction word printed.
+- **Helpers.** `guest_helpers64.so` (qsort, bsearch) is built when `aarch64-linux-gnu-gcc` (or `$A64_CC`) is installed. `ARCH=aarch64 poc/mpc_host/smoke.sh <fixture>/vst.json`
+  builds a fixture for aarch64 (cross compiler `$A64_CC`, libraries from `$A64_LIBDIR`, default `/usr/aarch64-linux-gnu/lib`) and runs it; CI runs statetest, threadtest, filetest and cxxtest this way.
+
+Checked 2026-11-06 on the 57 aarch64 `VSTPluginMain` builds found in the author's `~/mpc-vst-*` folders (libgcc_s and libstdc++ from the Ubuntu arm64 cross packages, loaded as guest libraries):
+- **All checked parameters restored from the chunk (30 files):** model303, acid303, Dexed DX7, JV-880 (ROM set linked into `MPC_HOST_ROOT`, 8162 B), maze voice and sequencer, boris, clementine_xt, lucky dip, morpho_pe,
+  profit5, trcw78, kr106, monomodule fx and one, the 8 airwin2rack plugins, and others. Audio rms is non-zero for the synths (model303 0.013, Dexed 0.042, maze voice 0.101, JV-880 0.041).
+  Speed on the 4-core VM, 128-frame blocks (2.9 ms): model303 16% of the budget, maze voice 5%, boris 2%, Dexed under 1%.
+- **Settable parameters, no chunk:** OTT, Reverbicon 224 (cineol224).
+- **Partial or no restore, not a host symptom as far as known:** machinedrum_one/b (the 512-byte chunk again, so a stale wrapper copy in those builds; the current wrapper's buffer is 8192),
+  je8086, vavra, nodalred2x, xenia, osirus, ms2kr: each restores some parameters from a short chunk (53-258 B). Not yet compared with a native build to tell whether the port
+  keeps only a subset or the host loses something.
+- **Stops on one import:** welle (`readlink`), the plugin manager (`statvfs`). **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: the A64 front end for the Gen2 (aarch64) builds, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: the partial restores on aarch64 (compare with native builds), `dl_iterate_phdr` for older libgcc, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
