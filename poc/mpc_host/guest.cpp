@@ -54,6 +54,8 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     std::vector<TlsMod> tls;                        // module id - 1
     uint32_t tls_used = 0;
     std::vector<uint32_t> keys;   // pthread_key values
+    struct Mod { gaddr base, end, exidx; uint32_t exidx_size; };   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
+    std::vector<Mod> mods;
     gaddr errno_p = 0, clocale = 0;
     std::unordered_map<std::string, gaddr> cstrs;
     gaddr c_locale() { if (!clocale) clocale = data(64, 8); return clocale; }
@@ -643,6 +645,11 @@ std::vector<Entry> libc_table() {
     for (const char* n : {"pthread_getschedparam", "pthread_getattr_np", "pthread_attr_getstack", "pthread_attr_getguardsize", "sched_getaffinity"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     for (const char* n : {"socketpair", "socket", "pipe"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("gettimeofday", [](I& i) { timeval tv; gettimeofday(&tv, nullptr); if (i.r(0)) { i.wr<int32_t>(i.r(0), (int32_t)tv.tv_sec); i.wr<int32_t>(i.r(0) + 4, (int32_t)tv.tv_usec); } i.ret(0); });
+    // ARM EHABI: the unwinder asks which exception index table covers a pc (glibc provides this, built on dl_iterate_phdr)
+    add("__gnu_Unwind_Find_exidx", [](I& i) {
+        for (auto& md : i.mods) if (i.r(0) >= md.base && i.r(0) < md.end && md.exidx) { if (i.r(1)) i.wr<uint32_t>(i.r(1), md.exidx_size / 8); i.ret(md.exidx); return; }
+        if (i.r(1)) i.wr<uint32_t>(i.r(1), 0);
+        i.ret(0); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
     // C++ runtime
@@ -784,8 +791,10 @@ bool Guest::load(const std::string& path) {
     const auto* ph = reinterpret_cast<const Elf32_Phdr*>(file.data() + eh->e_phoff);
     const Elf32_Dyn* dyn = nullptr;
     uint32_t end = 0, tls_id = 0;
+    std::pair<gaddr, uint32_t> exidx{0, 0};
     for (int k = 0; k < eh->e_phnum; k++) {
         if (ph[k].p_type == PT_LOAD) end = std::max(end, ph[k].p_vaddr + ph[k].p_memsz);
+        if (ph[k].p_type == PT_ARM_EXIDX) exidx = {bias + ph[k].p_vaddr, ph[k].p_memsz};
         if (ph[k].p_type == PT_LOAD) {
             std::memcpy(mem_ + bias + ph[k].p_vaddr, file.data() + ph[k].p_offset, ph[k].p_filesz);
             std::memset(mem_ + bias + ph[k].p_vaddr + ph[k].p_filesz, 0, ph[k].p_memsz - ph[k].p_filesz);
@@ -804,6 +813,7 @@ bool Guest::load(const std::string& path) {
     }
     if (!dyn) { err_ = "no PT_DYNAMIC"; return false; }
     i.load_next = (bias + end + 0xFFFFu) & ~0xFFFFu;
+    i.mods.push_back({bias, bias + end, exidx.first, exidx.second});
     // dynamic section (read after the copy: it lives in a loaded segment)
     uint32_t symtab = 0, strtab = 0, rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
     for (const Elf32_Dyn* d = reinterpret_cast<const Elf32_Dyn*>(mem_ + (reinterpret_cast<const uint8_t*>(dyn) - mem_)); d->d_tag != DT_NULL; d++) {

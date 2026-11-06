@@ -1,0 +1,9 @@
+{
+  "name": "MPC Host C++ Test",
+  "vendor": "open-mpc",
+  "uid": "HCxT",
+  "version": 1000,
+  "so": "cxxtest.so",
+  "params": "params.json",
+  "build": {"root": ".", "sources": ["engine.cpp"], "cflags": [], "libs": ["-lm", "-lstdc++"]}
+}

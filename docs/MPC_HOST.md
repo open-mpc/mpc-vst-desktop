@@ -179,14 +179,17 @@ restores, and compares each with its own saved value):
 | Result | Plugins |
 |---|---|
 | Runs; all checked parameters restored from the chunk | Dexed DX7 (2289 B), jn106, profit5, trcw78 (2 files), model303 and acid303, morpho_pe, clementine and clementine_xt, maze combo and sequencer, the 8 airwin2rack plugins, and, with threads (below), lucky dip (374 B), model72 (869 B), monomodule_fx (313 B). OTT, both Reverbicon builds and jv880 have settable parameters and no chunk |
-| Runs; restore not confirmed | machinedrum_one restores 0/8 from a 512 B chunk, also with two audio blocks processed after the restore; not yet known if the port applies state some other way. machinedrum tap and tapfx have no settable parameter |
+| Runs; restore not confirmed | machinedrum_one restores 0/8 from a 512 B chunk, also with two audio blocks processed after the restore. The armv7 build is older than the source (it writes `v1|...`, the source writes `v2|`; the current builds are aarch64 only), and 511 characters look cut off for 525 slots: the cause is in that old build, not found in the host. machinedrum tap and tapfx have no settable parameter |
 | Stops | MM-303: `getcwd`, sockets (device IPC). cratedigger (2 files): `VSTPluginMain` returns no `AEffect`; it imports `posix_spawn` and threads, so it probably starts helper processes. rhythmbank: imports the ALSA sequencer (`snd_seq_open`); the `abort` follows a failed open |
 
 A first run of this table showed clementine and morpho_pe restoring every parameter to 1.000. That was the host: `sscanf` ignored field
 widths, so a hex chunk read with `%2x` parsed as one number. Widths are implemented now and both restore correctly. The lesson for the next
 failure: a state bug that hits every parameter is probably a libc thunk, not the port.
 
-Dexed's C++ exceptions are not exercised yet: the unwinder needs `dl_iterate_phdr`, which calls back into guest code.
+C++ exceptions (2026-11-06, emulated): on ARM the unwinder finds its tables through `__gnu_Unwind_Find_exidx(pc, &count)`, not
+`dl_iterate_phdr`, so the host answers it from each module's `PT_ARM_EXIDX` segment and no guest-code trampoline is needed.
+`poc/mpc_host/cxxtest/` throws two frames deep and catches (with `std::string` and `std::map`); `smoke.sh` runs it on the cross sysroot's
+armhf libgcc_s and libstdc++ (CI installs `g++-arm-linux-gnueabihf`).
 
 ## Threads (2026-11-06, offline)
 
@@ -212,7 +215,7 @@ resumes at the `bx lr` after its own `svc`; no nested `Run()` is needed. Rules:
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` and exceptions, machinedrum_one's restore, MM-303, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: guest file access, the A64 front end for the Gen2 builds, the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 

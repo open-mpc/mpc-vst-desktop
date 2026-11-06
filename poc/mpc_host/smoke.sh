@@ -9,6 +9,8 @@ MV=$(cd "${MPC_VST_PLUGINS:-$HERE/mpc-vst-plugins}" && pwd)
 CFG=${1:-$MV/poc/songpos/vst.json}
 OUT=${MPC_HOST_BUILD:-$HERE/poc/mpc_host/build}
 "$HERE/poc/mpc_host/build.sh"
+# C++ fixtures run on the armhf libgcc_s and libstdc++ of the cross sysroot (the host loads them as guest libraries)
+case $CFG in *cxxtest*) SR=/usr/arm-linux-gnueabihf/lib; export MPC_HOST_LIBS=${MPC_HOST_LIBS:-$SR/libgcc_s.so.1:$SR/libstdc++.so.6} ;; esac
 eval "$(python3 "$MV/tools/gen_vst.py" "$CFG" --shell)"   # SO, SOURCES, CFLAGS, LIBS, ROOT, PORT
 python3 "$MV/tools/gen_vst.py" "$CFG" --params-h >/dev/null
 SO_OUT="$OUT/armv7/$SO"
@@ -18,5 +20,5 @@ mkdir -p "$OUT/armv7"
 "$OUT/mpc_host" "$SO_OUT" - 2 "$OUT/smoke" | tee "$OUT/smoke.txt"
 grep -q '^emulated: ' "$OUT/smoke.txt" && grep -q 'median' "$OUT/smoke.txt"
 # The statetest fixture has settable parameters and a chunk: the host must round-trip both.
-case $CFG in *statetest*|*threadtest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
+case $CFG in *statetest*|*threadtest*|*cxxtest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
 echo "smoke: passed"
