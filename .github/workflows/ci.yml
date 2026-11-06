@@ -1,0 +1,44 @@
+# The desktop VST3 rebuild and the host prototype, tested against the pinned mpc-vst-plugins and against its latest main
+# (so an engine.h or gen_vst.py change there shows up here before the submodule is bumped).
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1'   # weekly, against mpc-vst-plugins main
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  vst3:
+    strategy:
+      fail-fast: false
+      matrix:
+        plugins: [pinned, main]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Use mpc-vst-plugins main
+        if: matrix.plugins == 'main'
+        run: git -C mpc-vst-plugins fetch -q --depth 1 origin main && git -C mpc-vst-plugins checkout -q FETCH_HEAD
+      - name: Install
+        run: sudo apt-get update -q && sudo apt-get install -y -q libcairo2-dev libfreetype-dev libx11-dev
+      - name: Desktop VST3 test (probe port)
+        run: tools/test_vst3.sh mpc-vst-plugins/poc/songpos/vst.json
+  mpc-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install
+        run: sudo apt-get update -q && sudo apt-get install -y -q libboost-dev ninja-build gcc-arm-linux-gnueabihf
+      - uses: actions/cache@v4
+        with:
+          path: poc/mpc_host/build/dynarmic
+          key: dynarmic-${{ hashFiles('poc/mpc_host/build.sh') }}
+      - name: Build the prototype and run an armv7 probe emulated
+        run: poc/mpc_host/smoke.sh
