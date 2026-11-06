@@ -17,8 +17,11 @@ SO_OUT="$OUT/armv7/$SO"
 mkdir -p "$OUT/armv7"
 (cd "$ROOT" && arm-linux-gnueabihf-gcc -O2 -fPIC -shared -fvisibility=hidden -std=gnu11 $CFLAGS $CFLAGS_ARM -I"$PORT/build" -I"$MV/wrapper" \
     $SOURCES "$MV/wrapper/vst2_wrap.c" $LIBS -lpthread -lm -Wl,--no-undefined -o "$SO_OUT")
+# data files next to the plugin (/plugin/ in the guest) and a scratch root for writes (MPC_HOST_ROOT)
+for f in "$ROOT/$PORT"/*.txt; do [ -f "$f" ] && cp "$f" "$OUT/armv7/"; done
+export MPC_HOST_ROOT="$OUT/root"; rm -rf "$MPC_HOST_ROOT"; mkdir -p "$MPC_HOST_ROOT"
 "$OUT/mpc_host" "$SO_OUT" - 2 "$OUT/smoke" | tee "$OUT/smoke.txt"
 grep -q '^emulated: ' "$OUT/smoke.txt" && grep -q 'median' "$OUT/smoke.txt"
 # The statetest fixture has settable parameters and a chunk: the host must round-trip both.
-case $CFG in *statetest*|*threadtest*|*cxxtest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
+case $CFG in *statetest*|*threadtest*|*cxxtest*|*filetest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
 echo "smoke: passed"

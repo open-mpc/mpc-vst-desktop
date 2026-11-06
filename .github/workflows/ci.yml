@@ -46,5 +46,7 @@ jobs:
         run: poc/mpc_host/smoke.sh poc/mpc_host/statetest/vst.json
       - name: Guest threads (mutex, condition variable, worker) emulated
         run: poc/mpc_host/smoke.sh poc/mpc_host/threadtest/vst.json
+      - name: Guest file access, qsort and bsearch emulated
+        run: poc/mpc_host/smoke.sh poc/mpc_host/filetest/vst.json
       - name: C++ exceptions, std::string and std::map on the guest libstdc++ emulated
         run: poc/mpc_host/smoke.sh poc/mpc_host/cxxtest/vst.json

@@ -13,6 +13,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <glob.h>
+#include <fcntl.h>
+#include <dirent.h>
 #include <sys/time.h>
 #include <elf.h>
 #include <fstream>
@@ -57,6 +64,28 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     struct Mod { gaddr base, end, exidx; uint32_t exidx_size; };   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
     std::vector<Mod> mods;
     gaddr errno_p = 0, clocale = 0;
+    // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
+    std::unordered_map<gaddr, FILE*> files;
+    std::unordered_map<gaddr, DIR*> dirs;
+    std::string plugin_dir;
+    std::vector<std::string> mod_paths;   // parallel to mods
+    bool hostpath(const char* gp, std::string& out) {
+        std::string p = gp ? gp : "";
+        if (p.empty()) return false;
+        if (p[0] != '/') p = "/" + p;
+        if (p.find("/../") != std::string::npos || (p.size() > 3 && p.compare(p.size() - 3, 3, "/..") == 0)) return false;
+        if (p == "/plugin" || p.rfind("/plugin/", 0) == 0) { out = plugin_dir + p.substr(7); return true; }
+        if (const char* r = std::getenv("MPC_HOST_ROOT")) { out = std::string(r) + p; return true; }
+        return false;
+    }
+    std::string guestpath(const std::string& hp) {
+        if (!plugin_dir.empty() && hp.rfind(plugin_dir, 0) == 0) return "/plugin" + hp.substr(plugin_dir.size());
+        if (const char* r = std::getenv("MPC_HOST_ROOT")) { const std::string rr = r; if (hp.rfind(rr, 0) == 0) return hp.substr(rr.size()); }
+        return hp;
+    }
+    void set_errno(int e) { if (!errno_p) errno_p = data(4, 4); wr<int32_t>(errno_p, e); }
+    uint32_t fail(int e) { set_errno(e); return 0xFFFFFFFFu; }
+    FILE* file_of(gaddr f) { auto it = files.find(f); return it == files.end() ? nullptr : it->second; }
     std::unordered_map<std::string, gaddr> cstrs;
     gaddr c_locale() { if (!clocale) clocale = data(64, 8); return clocale; }
     gaddr cstr(const char* t) { auto& a = cstrs[t]; if (!a) { a = data((uint32_t)std::strlen(t) + 1, 1); std::strcpy((char*)m + a, t); } return a; }
@@ -337,10 +366,12 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         return out;
     }
 
+    size_t scan_used = 0;
     // sscanf: %d %i %u %x %o %f %g %e %s %c %n %% and literals, the l modifier, and * to skip. Field widths limit the input read.
     // Returns the number of stores, or -1 (EOF) if the input ends before the first conversion.
     int scan(const char* in, const char* f, VarArgs va) {
         int n = 0; const char* s = in;
+        struct Used { size_t& u; const char*& s; const char* in; ~Used() { u = (size_t)(s - in); } } used_guard{scan_used, s, in};   // how much input was consumed
         while (*f) {
             if (std::isspace((unsigned char)*f)) { while (std::isspace((unsigned char)*s)) s++; f++; continue; }
             if (*f != '%') { if (*s != *f) return (!*s && !n) ? -1 : n; s++; f++; continue; }
@@ -460,11 +491,6 @@ std::vector<Entry> libc_table() {
     add("puts", [](I& i) { std::fprintf(stderr, "[guest] %s\n", i.str(i.r(0))); i.ret(1); });
     add("printf", [](I& i) { const std::string s = i.format(i.str(i.r(0)), {i, 1, i.r(13)}); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
     add("__printf_chk", [](I& i) { const std::string s = i.format(i.str(i.r(1)), {i, 2, i.r(13)}); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
-    add("__fprintf_chk", [](I& i) { const std::string s = i.format(i.str(i.r(2)), {i, 3, i.r(13)}); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
-    add("fprintf", [](I& i) { const std::string s = i.format(i.str(i.r(1)), {i, 2, i.r(13)}); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
-    add("fflush", [](I& i) { i.ret(0); });
-    add("fopen", [](I& i) { i.ret(0); });     // no files yet: fopen fails
-    add("fopen64", [](I& i) { i.ret(0); });
     // time
     add("__clock_gettime64", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int64_t>(p, ts.tv_sec); i.wr<int32_t>(p + 8, (int32_t)ts.tv_nsec); i.wr<int32_t>(p + 12, 0); i.ret(0); });
     add("clock_gettime", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int32_t>(p, (int32_t)ts.tv_sec); i.wr<int32_t>(p + 4, (int32_t)ts.tv_nsec); i.ret(0); });
@@ -609,8 +635,8 @@ std::vector<Entry> libc_table() {
     add("__iswctype_l", [](I& i) { i.ret(i.r(0) < 128 ? (uint32_t)std::iswctype(i.r(0), (wctype_t)i.r(1)) : 0); });
     add("secure_getenv", [](I& i) { i.ret(0); });
     // no filesystem for guests: opens and reads fail the way a missing file would
-    for (const char* n : {"opendir", "readdir", "readdir64", "closedir", "fread", "fgets", "fwrite", "fputc", "fputs", "fclose"}) add(n, [](I& i) { i.ret(0); });
-    for (const char* n : {"fseek", "ftell", "mkdir", "access", "remove", "rename"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    for (const char* n : {"setvbuf"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"symlink", "link", "chown", "chmod", "fchmod", "fchmodat", "truncate64"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("rand", [](I& i) { i.ret((uint32_t)std::rand()); });
     add("srand", [](I& i) { std::srand(i.r(0)); });
     add("time", [](I& i) { const uint32_t t = (uint32_t)std::time(nullptr); if (i.r(0)) i.wr<uint32_t>(i.r(0), t); i.ret(t); });
@@ -619,11 +645,11 @@ std::vector<Entry> libc_table() {
     add("fma", [](I& i) { i.ret_d(std::fma(i.d(0), i.d(1), i.d(2))); });
     add("fmaf", [](I& i) { i.ret_f(std::fma(i.s(0), i.s(1), i.s(2))); });
     add("localtime", [](I& i) { i.ret(0); });   // callers log timestamps: a NULL result is allowed by the C standard
-    for (const char* n : {"dlopen", "dlsym", "dladdr", "dlerror"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"dlopen", "dlsym", "dlerror"}) add(n, [](I& i) { i.ret(0); });
     for (const char* n : {"sigaction", "pthread_attr_init", "pthread_attr_destroy", "pthread_attr_setschedpolicy", "pthread_attr_setschedparam",
                           "pthread_attr_setinheritsched", "pthread_setname_np", "pthread_setaffinity_np", "sched_setaffinity", "pthread_setschedparam"})
         add(n, [](I& i) { i.ret(0); });
-    for (const char* n : {"__xstat", "__lxstat", "__fxstat", "stat", "getrlimit", "snd_seq_open"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    for (const char* n : {"getrlimit", "snd_seq_open"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("strtok_r", [](I& i) {
         gaddr p = i.r(0) ? i.r(0) : i.rd<uint32_t>(i.r(2));
         const char* delim = i.str(i.r(1));
@@ -636,8 +662,6 @@ std::vector<Entry> libc_table() {
         i.wr<uint32_t>(i.r(2), p);
         i.ret(tok); });
     add("strftime", [](I& i) { if (i.r(1)) i.m[i.r(0)] = 0; i.ret(0); });   // no clock formatting: an empty string
-    add("glob", [](I& i) { i.ret(3); });                                      // GLOB_NOMATCH
-    add("globfree", [](I& i) { i.ret(0); });
     for (const char* n : {"setrlimit", "pthread_attr_setstacksize", "pthread_attr_setdetachstate"}) add(n, [](I& i) { i.ret(0); });
     add("aligned_alloc", [](I& i) { const gaddr p = i.malloc_(i.r(1) + i.r(0)); i.ret((p + i.r(0) - 1) & ~(i.r(0) - 1)); });
     add("setenv", [](I& i) { i.ret(0); });
@@ -650,6 +674,135 @@ std::vector<Entry> libc_table() {
         for (auto& md : i.mods) if (i.r(0) >= md.base && i.r(0) < md.end && md.exidx) { if (i.r(1)) i.wr<uint32_t>(i.r(1), md.exidx_size / 8); i.ret(md.exidx); return; }
         if (i.r(1)) i.wr<uint32_t>(i.r(1), 0);
         i.ret(0); });
+    // --- files (see Impl::hostpath): stdio on host FILE*s, fds are host fds, directories, stat, glob ---
+    auto out_file = [](I& i, gaddr f) -> FILE* { FILE* h = i.file_of(f); return h ? h : stderr; };
+    auto fopen_ = [](I& i) {
+        std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.set_errno(2); i.ret(0); return; }
+        FILE* f = std::fopen(hp.c_str(), i.str(i.r(1)));
+        if (!f) { i.set_errno(errno); i.ret(0); return; }
+        const gaddr h = i.malloc_(16); i.files[h] = f; i.ret(h); };
+    add("fopen", fopen_); add("fopen64", fopen_);
+    add("fclose", [](I& i) { FILE* f = i.file_of(i.r(0)); if (!f) { i.ret(0xFFFFFFFFu); return; } const int r = std::fclose(f); i.files.erase(i.r(0)); i.free_(i.r(0)); i.ret((uint32_t)r); });
+    add("fflush", [](I& i) { if (FILE* f = i.file_of(i.r(0))) std::fflush(f); i.ret(0); });
+    add("fread", [](I& i) { FILE* f = i.file_of(i.r(3)); i.ret(f ? (uint32_t)std::fread(i.m + i.r(0), i.r(1), i.r(2), f) : 0); });
+    add("__fread_chk", [](I& i) { FILE* f = i.file_of(i.arg(4)); i.ret(f ? (uint32_t)std::fread(i.m + i.r(0), i.r(2), i.r(3), f) : 0); });
+    add("fwrite", [](I& i) { FILE* f = i.file_of(i.r(3)); if (f) i.ret((uint32_t)std::fwrite(i.m + i.r(0), i.r(1), i.r(2), f)); else { std::fwrite(i.m + i.r(0), i.r(1), i.r(2), stderr); i.ret(i.r(2)); } });
+    add("fgets", [](I& i) { FILE* f = i.file_of(i.r(2)); i.ret(f && std::fgets((char*)i.m + i.r(0), (int)i.r(1), f) ? i.r(0) : 0); });
+    add("fgetc", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::fgetc(f) : 0xFFFFFFFFu); });
+    add("getc", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::fgetc(f) : 0xFFFFFFFFu); });
+    add("ungetc", [](I& i) { FILE* f = i.file_of(i.r(1)); i.ret(f ? (uint32_t)std::ungetc((int)i.r(0), f) : 0xFFFFFFFFu); });
+    add("fputc", [out_file](I& i) { std::fputc((int)i.r(0), out_file(i, i.r(1))); i.ret(i.r(0)); });
+    add("putc", [out_file](I& i) { std::fputc((int)i.r(0), out_file(i, i.r(1))); i.ret(i.r(0)); });
+    add("fputs", [out_file](I& i) { std::fputs(i.str(i.r(0)), out_file(i, i.r(1))); i.ret(1); });
+    add("feof", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::feof(f) : 1); });
+    add("ferror", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::ferror(f) : 1); });
+    add("rewind", [](I& i) { if (FILE* f = i.file_of(i.r(0))) std::rewind(f); });
+    add("fseek", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::fseek(f, (int32_t)i.r(1), (int)i.r(2)) : 0xFFFFFFFFu); });
+    add("ftell", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::ftell(f) : 0xFFFFFFFFu); });
+    add("fseeko64", [](I& i) { FILE* f = i.file_of(i.r(0)); const int64_t off = (int64_t)((uint64_t)i.r(2) | (uint64_t)i.r(3) << 32); i.ret(f ? (uint32_t)fseeko(f, off, (int)i.arg(4)) : 0xFFFFFFFFu); });
+    add("ftello64", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret64(f ? (uint64_t)ftello(f) : ~0ull); });
+    add("fprintf", [](I& i) { const std::string s = i.format(i.str(i.r(1)), {i, 2, i.r(13)}); if (FILE* f = i.file_of(i.r(0))) std::fputs(s.c_str(), f); else std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
+    add("__fprintf_chk", [](I& i) { const std::string s = i.format(i.str(i.r(2)), {i, 3, i.r(13)}); if (FILE* f = i.file_of(i.r(0))) std::fputs(s.c_str(), f); else std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
+    auto open_ = [](I& i) {
+        std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(2)); return; }
+        const uint32_t a = i.r(1);   // ARM O_* differ from x86 for DIRECTORY, NOFOLLOW, DIRECT and LARGEFILE
+        int fl = (int)(a & 0x3 ) | (int)(a & (0100 | 0200 | 0400 | 01000 | 02000 | 04000 | 02000000));
+        if (a & 040000) fl |= O_DIRECTORY;
+        if (a & 0100000) fl |= O_NOFOLLOW;
+        const int fd = ::open(hp.c_str(), fl, (mode_t)i.r(2));
+        i.ret(fd < 0 ? i.fail(errno) : (uint32_t)fd); };
+    add("open", open_); add("open64", open_);
+    add("__open64_2", open_); add("__openat64_2", [](I& i) { std::string hp; if (!i.hostpath(i.str(i.r(1)), hp)) { i.ret(i.fail(2)); return; } const int fd = ::open(hp.c_str(), (int)i.r(2) & 3); i.ret(fd < 0 ? i.fail(errno) : (uint32_t)fd); });
+    add("close", [](I& i) { i.ret(i.r(0) > 2 ? (uint32_t)::close((int)i.r(0)) : 0); });
+    add("read", [](I& i) { const ssize_t n = ::read((int)i.r(0), i.m + i.r(1), i.r(2)); i.ret(n < 0 ? i.fail(errno) : (uint32_t)n); });
+    add("__read_chk", [](I& i) { const ssize_t n = ::read((int)i.r(0), i.m + i.r(1), i.r(2)); i.ret(n < 0 ? i.fail(errno) : (uint32_t)n); });
+    add("write", [](I& i) { const int fd = (int)i.r(0) == 1 ? 2 : (int)i.r(0); const ssize_t n = ::write(fd, i.m + i.r(1), i.r(2)); i.ret(n < 0 ? i.fail(errno) : (uint32_t)n); });
+    add("lseek64", [](I& i) { const int64_t off = (int64_t)((uint64_t)i.r(2) | (uint64_t)i.r(3) << 32); i.ret64((uint64_t)::lseek((int)i.r(0), off, (int)i.arg(4))); });
+    add("access", [](I& i) { std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(2)); return; } i.ret(::access(hp.c_str(), (int)i.r(1)) ? i.fail(errno) : 0); });
+    add("mkdir", [](I& i) { std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(13)); return; } i.ret(::mkdir(hp.c_str(), (mode_t)i.r(1)) ? i.fail(errno) : 0); });
+    add("remove", [](I& i) { std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(13)); return; } i.ret(std::remove(hp.c_str()) ? i.fail(errno) : 0); });
+    add("rename", [](I& i) { std::string a, b; if (!i.hostpath(i.str(i.r(0)), a) || !i.hostpath(i.str(i.r(1)), b)) { i.ret(i.fail(13)); return; } i.ret(std::rename(a.c_str(), b.c_str()) ? i.fail(errno) : 0); });
+    add("getcwd", [](I& i) { if (i.r(1) < 2) { i.ret(0); return; } std::memcpy(i.m + i.r(0), "/", 2); i.ret(i.r(0)); });
+    // armhf `struct stat` (88 bytes, 32-bit st_size at 44) for __xstat/__lxstat/__fxstat, and `struct stat64` (st_size 64-bit at 48) for the *64 forms
+    auto put_stat = [](I& i, gaddr a, const struct stat& st, int mode) {   // mode 0: stat, 1: stat64, 2: stat with 64-bit times (glibc 2.34+, 112 bytes)
+        std::memset(i.m + a, 0, mode == 0 ? 88 : mode == 1 ? 104 : 112);   // exactly the guest struct: it sits on the guest stack
+        i.wr<uint32_t>(a + 16, st.st_mode); i.wr<uint32_t>(a + 20, (uint32_t)st.st_nlink); i.wr<uint32_t>(a + 24, st.st_uid); i.wr<uint32_t>(a + 28, st.st_gid);
+        i.wr<uint64_t>(a, st.st_dev); i.wr<uint64_t>(a + 32, st.st_rdev);
+        if (mode == 2) {
+            i.wr<uint64_t>(a + 8, st.st_ino); i.wr<uint64_t>(a + 40, (uint64_t)st.st_size); i.wr<uint32_t>(a + 48, (uint32_t)st.st_blksize); i.wr<uint64_t>(a + 56, (uint64_t)st.st_blocks);
+            i.wr<int64_t>(a + 64, st.st_atime); i.wr<int64_t>(a + 80, st.st_mtime); i.wr<int64_t>(a + 96, st.st_ctime);
+        } else if (mode == 1) {
+            i.wr<uint32_t>(a + 12, (uint32_t)st.st_ino); i.wr<uint64_t>(a + 48, (uint64_t)st.st_size); i.wr<uint32_t>(a + 56, (uint32_t)st.st_blksize); i.wr<uint64_t>(a + 64, (uint64_t)st.st_blocks);
+            i.wr<uint32_t>(a + 72, (uint32_t)st.st_atime); i.wr<uint32_t>(a + 80, (uint32_t)st.st_mtime); i.wr<uint32_t>(a + 88, (uint32_t)st.st_ctime); i.wr<uint64_t>(a + 96, st.st_ino);
+        } else {
+            i.wr<uint32_t>(a + 12, (uint32_t)st.st_ino); i.wr<uint32_t>(a + 44, (uint32_t)st.st_size); i.wr<uint32_t>(a + 48, (uint32_t)st.st_blksize); i.wr<uint32_t>(a + 52, (uint32_t)st.st_blocks);
+            i.wr<uint32_t>(a + 56, (uint32_t)st.st_atime); i.wr<uint32_t>(a + 64, (uint32_t)st.st_mtime); i.wr<uint32_t>(a + 72, (uint32_t)st.st_ctime); i.wr<uint64_t>(a + 80, st.st_ino);
+        }
+    };
+    for (const char* n : {"__xstat", "__xstat64", "__lxstat", "__lxstat64"}) {   // (ver, path, buf)
+        const int mode = std::strstr(n, "64") != nullptr ? 1 : 0; const bool lst = std::strstr(n, "lx") != nullptr;
+        add(n, [mode, lst, put_stat](I& i) {
+            std::string hp; if (!i.hostpath(i.str(i.r(1)), hp)) { i.ret(i.fail(2)); return; }
+            struct stat st; if ((lst ? ::lstat(hp.c_str(), &st) : ::stat(hp.c_str(), &st)) != 0) { i.ret(i.fail(errno)); return; }
+            put_stat(i, i.r(2), st, mode); i.ret(0); });
+    }
+    for (const char* n : {"__stat64_time64", "__lstat64_time64"}) {   // (path, buf)
+        const bool lst = std::strstr(n, "lstat") != nullptr;
+        add(n, [lst, put_stat](I& i) {
+            std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(2)); return; }
+            struct stat st; if ((lst ? ::lstat(hp.c_str(), &st) : ::stat(hp.c_str(), &st)) != 0) { i.ret(i.fail(errno)); return; }
+            put_stat(i, i.r(1), st, 2); i.ret(0); });
+    }
+    for (const char* n : {"__fxstat", "__fxstat64"}) {
+        const int mode = std::strstr(n, "64") != nullptr ? 1 : 0;
+        add(n, [mode, put_stat](I& i) { struct stat st; if (::fstat((int)i.r(1), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(2), st, mode); i.ret(0); });
+    }
+    add("__fstat64_time64", [put_stat](I& i) { struct stat st; if (::fstat((int)i.r(0), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(1), st, 2); i.ret(0); });
+    // fscanf: read ahead into a buffer, scan it, and seek back over what was not consumed (regular files)
+    auto fscanf_ = [](I& i) {
+        FILE* f = i.file_of(i.r(0)); if (!f) { i.ret(0xFFFFFFFFu); return; }
+        const long pos = std::ftell(f); char buf[4096]; const size_t got = std::fread(buf, 1, sizeof buf - 1, f); buf[got] = 0;
+        const int n = i.scan(buf, i.str(i.r(1)), {i, 2, i.r(13)});
+        if (pos >= 0) std::fseek(f, pos + (long)i.scan_used, SEEK_SET);
+        i.ret((uint32_t)n); };
+    for (const char* n : {"fscanf", "__isoc99_fscanf", "__isoc23_fscanf"}) add(n, fscanf_);
+    // directories: DIR* is a guest handle; the dirent lives in a 288-byte guest buffer (armhf dirent: d_ino +0, d_type +10, d_name +11; dirent64: d_ino +0, d_type +18, d_name +19)
+    add("opendir", [](I& i) {
+        std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.set_errno(2); i.ret(0); return; }
+        DIR* d = ::opendir(hp.c_str()); if (!d) { i.set_errno(errno); i.ret(0); return; }
+        const gaddr h = i.malloc_(288); i.dirs[h] = d; i.ret(h); });
+    auto readdir_ = [](I& i, bool is64) {
+        auto it = i.dirs.find(i.r(0)); if (it == i.dirs.end()) { i.ret(0); return; }
+        const dirent* e = ::readdir(it->second); if (!e) { i.ret(0); return; }
+        const gaddr b = i.r(0); std::memset(i.m + b, 0, 288);
+        if (is64) { i.wr<uint64_t>(b, e->d_ino); i.wr<uint16_t>(b + 16, 280); i.m[b + 18] = e->d_type; std::strncpy((char*)i.m + b + 19, e->d_name, 255); }
+        else { i.wr<uint32_t>(b, (uint32_t)e->d_ino); i.wr<uint16_t>(b + 8, 280); i.m[b + 10] = e->d_type; std::strncpy((char*)i.m + b + 11, e->d_name, 255); }
+        i.ret(b); };
+    add("readdir", [readdir_](I& i) { readdir_(i, false); });
+    add("readdir64", [readdir_](I& i) { readdir_(i, true); });
+    add("closedir", [](I& i) { auto it = i.dirs.find(i.r(0)); if (it != i.dirs.end()) { ::closedir(it->second); i.dirs.erase(it); i.free_(i.r(0)); } i.ret(0); });
+    // glob_t (armhf): gl_pathc +0, gl_pathv +4, gl_offs +8
+    auto glob_ = [](I& i) {
+        std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(3); return; }
+        glob_t g{}; if (::glob(hp.c_str(), 0, nullptr, &g) != 0) { i.ret(3); return; }   // GLOB_NOMATCH
+        const gaddr vec = i.malloc_(4 * ((uint32_t)g.gl_pathc + 1));
+        for (size_t k = 0; k < g.gl_pathc; k++) i.wr<uint32_t>(vec + 4 * (uint32_t)k, i.g.strdup(i.guestpath(g.gl_pathv[k]).c_str()));
+        i.wr<uint32_t>(vec + 4 * (uint32_t)g.gl_pathc, 0);
+        i.wr<uint32_t>(i.r(3), (uint32_t)g.gl_pathc); i.wr<uint32_t>(i.r(3) + 4, vec); i.wr<uint32_t>(i.r(3) + 8, 0);
+        globfree(&g); i.ret(0); };
+    for (const char* n : {"glob", "glob64", "__glob64_time64"}) add(n, glob_);
+    for (const char* n : {"globfree", "globfree64", "__globfree64_time64"}) add(n, [](I& i) { i.ret(0); });   // the vectors are left in the guest heap
+    // dladdr: Dl_info { fname, fbase, sname, saddr }; /plugin/<name> for the loaded plugin, /lib/<name> for libraries
+    add("dladdr", [](I& i) {
+        for (size_t k = 0; k < i.mods.size(); k++) {
+            if (i.r(0) < i.mods[k].base || i.r(0) >= i.mods[k].end) continue;
+            const std::string nm = std::filesystem::path(i.mod_paths[k]).filename().string();
+            const bool is_lib = k + 1 < i.mods.size() && std::getenv("MPC_HOST_LIBS");   // libraries load before the plugin
+            i.wr<uint32_t>(i.r(1), i.g.strdup(((is_lib ? "/lib/" : "/plugin/") + nm).c_str())); i.wr<uint32_t>(i.r(1) + 4, i.mods[k].base); i.wr<uint32_t>(i.r(1) + 8, 0); i.wr<uint32_t>(i.r(1) + 12, 0);
+            i.ret(1); return;
+        }
+        i.ret(0); });
+    for (const char* n : {"getpwnam", "getpwuid", "getenv_s"}) add(n, [](I& i) { i.ret(0); });   // no user database
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
     // C++ runtime
@@ -814,6 +967,9 @@ bool Guest::load(const std::string& path) {
     if (!dyn) { err_ = "no PT_DYNAMIC"; return false; }
     i.load_next = (bias + end + 0xFFFFu) & ~0xFFFFu;
     i.mods.push_back({bias, bias + end, exidx.first, exidx.second});
+    i.mod_paths.push_back(path);
+    if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + end);
+    i.plugin_dir = std::filesystem::path(path).parent_path().string();
     // dynamic section (read after the copy: it lives in a loaded segment)
     uint32_t symtab = 0, strtab = 0, rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
     for (const Elf32_Dyn* d = reinterpret_cast<const Elf32_Dyn*>(mem_ + (reinterpret_cast<const uint8_t*>(dyn) - mem_)); d->d_tag != DT_NULL; d++) {

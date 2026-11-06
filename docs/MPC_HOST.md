@@ -211,11 +211,29 @@ resumes at the `bx lr` after its own `svc`; no nested `Run()` is needed. Rules:
 - `MPC_HOST_TRACE=1` prints every thunk call with the guest thread id. That showed a polling worker (`opendir`, `nanosleep`) running forever
   until the clock was only advanced while the main thread waits.
 
+## Files, qsort, JV-880 (2026-11-06, offline)
+
+- **File access.** `MPC_HOST_ROOT=<dir>` is the guest's `/`: `/sdcard/x` is `<dir>/sdcard/x`. `/plugin/` is the directory of the plugin `.so`, and `dladdr` reports
+  `/plugin/<name>`. Without `MPC_HOST_ROOT` only `/plugin/` exists. Paths with `..` are refused. Done: `fopen`/`fclose`/`fread`/`fwrite`/`fgets`/`fgetc`/`fputs`/`fseek`/`ftell`
+  (and the 64-bit forms), `fprintf`/`fscanf` on files, `open`/`read`/`write`/`lseek64`/`close` on host fds (ARM `O_*` flags translated), `stat` in the old `__xstat`
+  family (88-byte `struct stat`, 104-byte `stat64`) and the glibc 2.34+ `__stat64_time64` (112 bytes), `opendir`/`readdir`/`readdir64`, `glob`, `mkdir`, `access`, `remove`, `rename`,
+  `getcwd` (always `/`). `poc/mpc_host/filetest/` checks them; `smoke.sh` copies the fixture's `*.txt` next to the `.so` and uses a fresh scratch root.
+  ROM sets are not copied or committed: link them into a root (`ln -s ~/roms/jv880 $ROOT/sdcard/vst/jv880-roms/roms`).
+- **qsort and bsearch** take a guest comparator, which a host thunk cannot call. `guest_helpers.c` provides them as armhf guest code (a stable merge sort); `build.sh`
+  builds `build/guest_helpers.so` when `arm-linux-gnueabihf-gcc` is installed and `mpc_host` loads it before any other module.
+- **A bug found on the way:** the first `put_stat` cleared 128 bytes, but the old-ABI `struct stat` is 88, so it wrote over the guest's stack and lucky dip, which had
+  passed with `stat` failing, jumped to address 0 once `stat` succeeded. It clears exactly the size of each flavour now. `MPC_HOST_TRACE=1` also prints each module's address range.
+- **JV-880** (`mpc-vst-jv880`, the ROM set from `~/roms/jv880`, linked as above): loads the ROMs and 19 expansions (4133 patches in 22 banks) on a background thread, starts its emulation
+  thread, and renders sound: rms 0.041, peak 0.229 over 4 s of the test line, median 1.98 ms per 128-frame block (68% of the 2.9 ms budget, p99 3.5 ms, max 3.7 ms) on
+  the 4-core VM, one instance. The state check restores 8/8 parameters from an 8162-byte chunk.
+- Not working: **cratedigger** returns no `AEffect` even with `/media/*/AddOns/ForceCrateDigger` created (it is a device add-on that runs `yt-dlp` and a shell);
+  **rhythmbank** needs the ALSA sequencer; **clementine** (the non-XT build) needs `iswspace`; **machinedrum_one** is unresolved (see the survey).
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: guest file access, the A64 front end for the Gen2 builds, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: the A64 front end for the Gen2 (aarch64) builds, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 

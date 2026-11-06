@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -49,6 +50,11 @@ struct Emulated : Plugin {
     gaddr eff = 0, disp = 0, proc = 0, buf_l = 0, buf_r = 0, outs = 0, ins = 0, evs = 0, ev = 0;
     int nev = 0;
     bool open(const char* path) {
+        // libc functions that call back into guest code (qsort, bsearch) are guest code too: guest_helpers.so, built next to this program
+        {
+            char exe[4096]; const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+            if (n > 0) { exe[n] = 0; const std::string h = std::string(exe).substr(0, std::string(exe).rfind('/')) + "/guest_helpers.so"; if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
+        }
         // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
         if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
             std::string l = libs;
