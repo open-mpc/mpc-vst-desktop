@@ -16,6 +16,7 @@ public:
     // Loads the .so, applies relocations and runs its constructors. False on error (see error()).
     bool load(const std::string& path);
     bool is64() const;
+    const std::vector<std::string>& stubs_called() const;   // unsupported imports called so far (needs MPC_HOST_LAX=1 set before the first call)
     const std::string& error() const { return err_; }
     const std::vector<std::string>& missing() const { return missing_; }   // imports with no thunk (called = abort)
 

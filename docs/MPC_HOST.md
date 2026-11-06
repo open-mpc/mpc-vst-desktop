@@ -281,6 +281,22 @@ So running each guest thread on its own host thread would not make Osirus real t
 moving its emulation thread off the audio call. The limit for Osirus is the speed of the translated code (a DSP emulator whose own JIT output is translated again). For such a plugin
 the other path in this repo, rebuilding from source as a native VST3, is the right one.
 
+## Keeping the host off plugins it handles badly (2026-11-06, offline)
+
+`mpc_host --check <plugin.so> [timeout s]` decides whether a plugin should be used at all and prints one JSON line (exit code 0 ok, 3 degraded, 4 blocked). The probe
+runs in a child process, so a guest abort, crash or hang cannot take the caller down. It loads the plugin, runs 2 s of the test line at 128-frame blocks with unsupported
+imports stubbed (`MPC_HOST_LAX`), so the ones the plugin actually calls are recorded, then runs the state round trip.
+- **blocked** (do not load): it fails to load or start, crashes or hangs (with the guest's last message, e.g. `called abort`), calls a function the host does not provide,
+  or is too slow for real time here (median at least 80% or p99 at least 100% of a block).
+- **degraded** (load with a warning): heavy (median at least 50% or p99 at least 80%), or the state does not fully round-trip.
+- **ok**: none of the above.
+
+Checked 2026-11-06 (aarch64 builds, 4-core VM): Model-303 ok (17% median), Maze Voice ok (5%), JV-880 degraded (heavy: 50% median, 79% p99), Osirus blocked (115% median, 269% p99),
+cratedigger blocked (cannot start), rhythmbank (armv7) blocked (`crashed (signal 6): guest: called abort`), machinedrum_one (armv7) degraded (state not restored).
+`MPC_HOST_ENFORCE=1` makes a normal run do the check first and refuse a blocked plugin (exit 4); `MPC_HOST_FORCE=1` overrides it. A plugin scanner (the future VST3 shell)
+should run `--check` once per plugin file and host build, keep the verdict (key: file size and mtime, host version), load only what is not blocked, and show the reasons for the
+rest. The thresholds depend on the machine, so a verdict is a statement about this machine; the numbers are in the JSON. `smoke.sh` runs `--check` on every fixture and requires "ok".
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session

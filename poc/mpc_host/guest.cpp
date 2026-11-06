@@ -72,6 +72,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<uint32_t> keys;   // pthread_key values
     struct Mod { gaddr base, end, exidx; uint32_t exidx_size; gaddr eh = 0; };   // eh: .eh_frame_hdr (PT_GNU_EH_FRAME) for _dl_find_object   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
     std::vector<Mod> mods;
+    std::vector<std::string> stubs_called;   // unsupported imports the guest actually called (MPC_HOST_LAX only; otherwise the first one aborts)
     gaddr errno_p = 0, clocale = 0;
     // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
     std::unordered_map<gaddr, FILE*> files;
@@ -601,7 +602,7 @@ struct Entry { const char* name; Thunk fn; };
 void abort_named(I& i, const std::string& n) {
     static const bool lax = std::getenv("MPC_HOST_LAX") != nullptr;
     static std::unordered_map<std::string, int> seen;
-    if (lax && n.find("stack smashed") == std::string::npos && n != "abort") { if (!seen[n]++) std::fprintf(stderr, "guest: stub %s, lr=%08x\n", n.c_str(), i.r(14)); i.ret(0); return; }
+    if (lax && n.find("stack smashed") == std::string::npos && n != "abort") { if (!seen[n]++) { std::fprintf(stderr, "guest: stub %s, lr=%08x\n", n.c_str(), i.r(14)); i.stubs_called.push_back(n); } i.ret(0); return; }
     std::fprintf(stderr, "guest: called %s (not supported), lr=%08x\n", n.c_str(), i.r(14));
     std::abort();
 }
@@ -1180,6 +1181,7 @@ Guest::~Guest() {
 }
 
 bool Guest::is64() const { return impl_->a64; }
+const std::vector<std::string>& Guest::stubs_called() const { return impl_->stubs_called; }
 uint32_t Guest::rd32(gaddr a) const { return impl_->rd<uint32_t>(a); }
 void Guest::wr32(gaddr a, uint32_t v) { impl_->wr<uint32_t>(a, v); }
 gaddr Guest::alloc(uint32_t n) { return impl_->malloc_(n); }

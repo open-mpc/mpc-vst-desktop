@@ -27,4 +27,7 @@ export MPC_HOST_ROOT="$OUT/root"; rm -rf "$MPC_HOST_ROOT"; mkdir -p "$MPC_HOST_R
 grep -q '^emulated: ' "$OUT/smoke.txt" && grep -q 'median' "$OUT/smoke.txt"
 # The statetest fixture has settable parameters and a chunk: the host must round-trip both.
 case $CFG in *statetest*|*threadtest*|*cxxtest*|*filetest*) grep -q 'parameters restored from .*(ok)' "$OUT/smoke.txt" ;; esac
+# --check must call the fixture usable (exit 0 = "ok"; 3 = degraded, 4 = blocked fail the test)
+"$OUT/mpc_host" --check "$SO_OUT" 120 | tee "$OUT/check.json"
+grep -q '"verdict":"ok"' "$OUT/check.json"
 echo "smoke: passed"

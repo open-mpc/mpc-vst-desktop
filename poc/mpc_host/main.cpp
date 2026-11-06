@@ -10,6 +10,9 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -240,6 +243,7 @@ void report(const char* what, const Run& r) {
 }
 // Parameters and state: take up to 8 parameters that read back what was set (readouts do not), set them to 0.25, save the chunk,
 // set them to 0.75, restore the chunk, and expect each parameter to read what it read before the save.
+std::string g_state_note;   // a one-word summary of the last state_check, for --check
 bool state_check(const char* what, Plugin& p) {
     std::vector<int> idx; std::vector<float> saved;
     for (int i = 0; i < p.num_params() && idx.size() < 8; i++) {
@@ -248,11 +252,11 @@ bool state_check(const char* what, Plugin& p) {
         if (std::getenv("MPC_HOST_DUMP")) std::printf("  param %d: set 0.25 reads %.3f, set 0.75 reads %.3f\n", i, v, w);
         if (std::fabs(v - 0.25f) < 0.15f && std::fabs(w - 0.75f) < 0.15f && w > v) idx.push_back(i);   // quantised parameters round
     }
-    if (idx.empty()) { std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
+    if (idx.empty()) { g_state_note = "no settable parameter"; std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
     for (int i : idx) { p.set_param(i, 0.25f); saved.push_back(p.get_param(i)); }
     const auto chunk = p.get_chunk();
     for (int i : idx) p.set_param(i, 0.75f);
-    if (chunk.empty()) { std::printf("%-9s state: %zu settable parameters, no chunk (ok)\n", what, idx.size()); return true; }
+    if (chunk.empty()) { g_state_note = "no chunk"; std::printf("%-9s state: %zu settable parameters, no chunk (ok)\n", what, idx.size()); return true; }
     const bool restored = p.set_chunk(chunk);
     { float l[kBlock], r[kBlock]; p.process(l, r); p.process(l, r); }   // some ports apply a restored state on the next audio block
     std::string bad; int good = 0;
@@ -261,14 +265,104 @@ bool state_check(const char* what, Plugin& p) {
         if (std::fabs(c - saved[k]) < 0.005f) good++; else { char t[64]; std::snprintf(t, sizeof t, " %d:%.3f->%.3f", idx[k], saved[k], c); bad += t; }
     }
     const bool ok = restored && bad.empty();
+    g_state_note = ok ? "round-trips" : good > 0 ? "partial" : "not restored";
     if (!ok && std::getenv("MPC_HOST_DUMP")) { const auto after = p.get_chunk(); std::printf("chunk before: %.*s\nchunk after:  %.*s\n", (int)std::min<size_t>(chunk.size(), 300), (const char*)chunk.data(), (int)std::min<size_t>(after.size(), 300), (const char*)after.data()); }
     std::printf("%-9s state: %d/%zu parameters restored from a %zu-byte chunk (%s)%s\n", what, good, idx.size(), chunk.size(), ok ? "ok" : "FAILED", bad.c_str());
     return ok;
 }
 }  // namespace
 
+// --- --check: decide whether the host should use a plugin at all -------------------------------------------------------------------
+// The probe runs in a child process (a guest abort or a hang must not take the caller down). It loads the plugin, runs two seconds of the test line at
+// real-time block size with unsupported imports stubbed (so the ones it actually calls are recorded), and checks the state round trip.
+// Verdicts: "blocked" (do not use: fails to load or start, crashes, hangs, calls unsupported functions, or is too slow for real time),
+// "degraded" (usable with a warning: heavy CPU use, or state that does not fully round-trip), "ok".
+constexpr double kBlockedPct = 80, kDegradedPct = 50, kP99BlockedPct = 100, kP99DegradedPct = 80;
+
+std::string jesc(const std::string& s) {
+    std::string o; for (char c : s) { if (c == '"' || c == '\\') { o += '\\'; o += c; } else if ((unsigned char)c < 32) o += ' '; else o += c; } return o;
+}
+std::string jlist(const std::vector<std::string>& v) { std::string o = "["; for (size_t k = 0; k < v.size(); k++) { if (k) o += ","; o += "\"" + jesc(v[k]) + "\""; } return o + "]"; }
+
+int probe(const char* path, int out_fd) {
+    ::setenv("MPC_HOST_LAX", "1", 1);   // before the first unsupported call: record them instead of stopping
+    bool a64 = false;
+    if (FILE* f = std::fopen(path, "rb")) { unsigned char id[5] = {}; if (std::fread(id, 1, 5, f) == 5) a64 = id[4] == 2; std::fclose(f); }
+    std::vector<std::string> reasons, warnings;
+    std::string verdict = "ok", name;
+    double med_pct = 0, p99_pct = 0, rms = 0;
+    std::string state = "n/a";
+    auto emu = std::make_unique<Emulated>(a64);
+    if (!emu->open(path)) { verdict = "blocked"; reasons.push_back("could not load or start the plugin"); }
+    else {
+        name = emu->name();
+        const Run a = render(*emu, (int)(2 * kRate / kBlock));
+        std::vector<double> us(a.us.begin() + std::min<size_t>(a.us.size(), 50), a.us.end());   // skip the JIT warm-up
+        std::sort(us.begin(), us.end());
+        const double budget = kBlock / kRate * 1e6;
+        if (!us.empty()) { med_pct = 100 * us[us.size() / 2] / budget; p99_pct = 100 * us[us.size() * 99 / 100] / budget; }
+        double sum = 0; for (float s : a.l) sum += (double)s * s; rms = std::sqrt(sum / std::max<size_t>(1, a.l.size()));
+        const bool state_ok = state_check("emulated", *emu);
+        state = g_state_note.empty() ? "n/a" : g_state_note;
+        if (!emu->g.stubs_called().empty()) { verdict = "blocked"; reasons.push_back("calls functions the host does not provide: " + [&] { std::string s; for (auto& n : emu->g.stubs_called()) s += (s.empty() ? "" : ", ") + n; return s; }()); }
+        if (med_pct >= kBlockedPct || p99_pct >= kP99BlockedPct) { verdict = "blocked"; char b[160]; std::snprintf(b, sizeof b, "too slow for real time here: median %.0f%% and p99 %.0f%% of a block", med_pct, p99_pct); reasons.push_back(b); }
+        else if (med_pct >= kDegradedPct || p99_pct >= kP99DegradedPct) { if (verdict == "ok") verdict = "degraded"; char b[160]; std::snprintf(b, sizeof b, "heavy: median %.0f%% and p99 %.0f%% of a block", med_pct, p99_pct); warnings.push_back(b); }
+        if (!state_ok) { if (verdict == "ok") verdict = "degraded"; warnings.push_back("state does not fully round-trip (" + state + ")"); }
+    }
+    char num[200]; std::snprintf(num, sizeof num, "\"median_pct\":%.1f,\"p99_pct\":%.1f,\"rms\":%.4f", med_pct, p99_pct, rms);
+    const std::string json = "{\"plugin\":\"" + jesc(path) + "\",\"name\":\"" + jesc(name) + "\",\"arch\":\"" + (a64 ? "aarch64" : "armv7") + "\",\"verdict\":\"" + verdict + "\",\"reasons\":" +
+                             jlist(reasons) + ",\"warnings\":" + jlist(warnings) + "," + num + ",\"state\":\"" + jesc(state) + "\"}\n";
+    (void)!::write(out_fd, json.data(), json.size());
+    return 0;
+}
+
+// Runs probe() in a child with a time limit. Exit code: 0 ok, 3 degraded, 4 blocked. Prints one JSON line.
+int check_main(const char* path, int timeout_s) {
+    int jp[2], ep[2];
+    if (pipe(jp) || pipe(ep)) { std::perror("pipe"); return 4; }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        ::close(jp[0]); ::close(ep[0]);
+        ::dup2(ep[1], 2); ::dup2(ep[1], 1);   // everything the guest and the probe print goes to the diagnostics pipe
+        ::_exit(probe(path, jp[1]));
+    }
+    ::close(jp[1]); ::close(ep[1]);
+    std::string json, diag;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool timed_out = false;
+    pollfd fds[2] = {{jp[0], POLLIN, 0}, {ep[0], POLLIN, 0}};
+    int open_fds = 2;
+    while (open_fds > 0) {
+        const double left = timeout_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (left <= 0) { timed_out = true; ::kill(pid, SIGKILL); break; }
+        if (::poll(fds, 2, (int)(left * 1000)) <= 0) continue;
+        for (int k = 0; k < 2; k++) {
+            if (fds[k].fd < 0 || !(fds[k].revents & (POLLIN | POLLHUP))) continue;
+            char buf[4096]; const ssize_t n = ::read(fds[k].fd, buf, sizeof buf);
+            if (n <= 0) { fds[k].fd = -1; open_fds--; } else (k == 0 ? json : diag).append(buf, (size_t)n);
+        }
+    }
+    int status = 0; ::waitpid(pid, &status, 0);
+    if (json.empty()) {   // the child died or hung before it could report
+        std::string why = timed_out ? "hung: no result within " + std::to_string(timeout_s) + " s"
+                          : WIFSIGNALED(status) ? "crashed (signal " + std::to_string(WTERMSIG(status)) + ")" : "exited without a result";
+        // the guest's last words, e.g. "guest: called X (not supported)"
+        std::string hint; size_t pos = diag.rfind("guest:");
+        if (pos != std::string::npos) hint = diag.substr(pos, diag.find('\n', pos) - pos);
+        json = "{\"plugin\":\"" + jesc(path) + "\",\"verdict\":\"blocked\",\"reasons\":" + jlist({why + (hint.empty() ? "" : ": " + hint)}) + ",\"warnings\":[]}\n";
+    }
+    std::fputs(json.c_str(), stdout);
+    return json.find("\"verdict\":\"blocked\"") != std::string::npos ? 4 : json.find("\"verdict\":\"degraded\"") != std::string::npos ? 3 : 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s <armv7 .so> [native .so] [seconds] [out prefix]\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s <plugin .so> [native .so] [seconds] [out prefix]\n       %s --check <plugin .so> [timeout seconds]   (prints a JSON verdict; exit 0 ok, 3 degraded, 4 blocked)\n", argv[0], argv[0]); return 2; }
+    if (!std::strcmp(argv[1], "--check")) { if (argc < 3) return 2; return check_main(argv[2], argc > 3 ? std::atoi(argv[3]) : 180); }
+    // MPC_HOST_ENFORCE=1: check the plugin first and refuse a blocked one (MPC_HOST_FORCE=1 overrides). A host that scans for plugins does the same with --check.
+    if (std::getenv("MPC_HOST_ENFORCE") && !std::getenv("MPC_HOST_FORCE")) {
+        const int rc = check_main(argv[1], 180);
+        if (rc == 4) { std::fprintf(stderr, "mpc_host: refusing %s (blocked, see above); MPC_HOST_FORCE=1 runs it anyway\n", argv[1]); return 4; }
+    }
     const double secs = argc > 3 ? std::atof(argv[3]) : 10;
     const std::string prefix = argc > 4 ? argv[4] : "mpc_host";
     const int blocks = (int)(secs * kRate / kBlock);
