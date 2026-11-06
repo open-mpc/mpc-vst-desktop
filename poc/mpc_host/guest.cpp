@@ -69,7 +69,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<TlsMod> tls;                        // module id - 1
     uint32_t tls_used = 0;
     std::vector<uint32_t> keys;   // pthread_key values
-    struct Mod { gaddr base, end, exidx; uint32_t exidx_size; };   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
+    struct Mod { gaddr base, end, exidx; uint32_t exidx_size; gaddr eh = 0; };   // eh: .eh_frame_hdr (PT_GNU_EH_FRAME) for _dl_find_object   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
     std::vector<Mod> mods;
     gaddr errno_p = 0, clocale = 0;
     // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
@@ -106,6 +106,9 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
 
     // --- dynarmic callbacks (fastmem covers almost everything; these are the slow path) ---
     template <class T> T rd(uint32_t a) { T v; std::memcpy(&v, m + a, sizeof v); return v; }
+    // a pointer-sized value in guest memory (4 bytes armhf, 8 bytes aarch64; guest addresses are below 2 GB)
+    uint32_t rdp(uint32_t a) { return rd<uint32_t>(a); }
+    void wrp(uint32_t a, uint32_t v) { wr<uint32_t>(a, v); if (a64) wr<uint32_t>(a + 4, 0); }
     template <class T> void wr(uint32_t a, T v) { std::memcpy(m + a, &v, sizeof v); }
     uint8_t MemoryRead8(uint32_t a) override { return rd<uint8_t>(a); }
     uint16_t MemoryRead16(uint32_t a) override { return rd<uint16_t>(a); }
@@ -228,7 +231,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         switch (t.st) {
         case WaitMutex: try_lock(t.obj, t.id); break;
         case WaitCond: try_lock(t.mtx, t.id); break;
-        case WaitJoin: if (t.join_ret) wr<uint32_t>(t.join_ret, th[t.obj - 1]->retval); break;
+        case WaitJoin: if (t.join_ret) wrp(t.join_ret, th[t.obj - 1]->retval); break;
         default: break;
         }
         if (t.st != Run) { t.ret0 = r0; t.has_ret0 = true; }
@@ -395,10 +398,34 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     // --- printf: format from guest memory with guest varargs ---
     struct VarArgs {
         Impl& i; int reg; uint32_t sp;
-        uint32_t next32() { if (reg < 4) return i.r(reg++); const uint32_t v = i.rd<uint32_t>(sp); sp += 4; return v; }
+        int fpreg = 0;      // aarch64: next v register for a double
+        uint32_t va = 0;    // aarch64: a va_list structure {stack, gr_top, vr_top, gr_offs, vr_offs} instead of live registers
+        // armhf: variadic arguments are all in core registers or on the stack, 8-byte values 8-aligned. aarch64: integers in x0-x7, doubles in v0-v7, then 8-byte stack slots.
+        uint64_t next_int() {   // aarch64
+            if (va) {
+                const int32_t gr = i.rd<int32_t>(va + 24);
+                if (gr < 0) { const uint64_t v = i.rd<uint64_t>(i.rdp(va + 8) + gr); i.wr<int32_t>(va + 24, gr + 8); return v; }
+                const uint32_t st = i.rdp(va); const uint64_t v = i.rd<uint64_t>(st); i.wrp(va, st + 8); return v;
+            }
+            if (reg < 8) return i.x(reg++);
+            const uint64_t v = i.rd<uint64_t>(sp); sp += 8; return v;
+        }
+        uint32_t next32() { if (i.a64) return (uint32_t)next_int(); if (reg < 4) return i.r(reg++); const uint32_t v = i.rd<uint32_t>(sp); sp += 4; return v; }
         uint64_t next64() {
+            if (i.a64) return next_int();
             if (reg < 4) { if (reg & 1) reg++; if (reg < 4) { const uint64_t v = i.r(reg) | (uint64_t)i.r(reg + 1) << 32; reg += 2; return v; } }
             sp = (sp + 7) & ~7u; const uint64_t v = i.rd<uint64_t>(sp); sp += 8; return v;
+        }
+        double next_double() {
+            uint64_t u;
+            if (!i.a64) u = next64();
+            else if (va) {
+                const int32_t vr = i.rd<int32_t>(va + 28);
+                if (vr < 0) { u = i.rd<uint64_t>(i.rdp(va + 16) + vr); i.wr<int32_t>(va + 28, vr + 16); }
+                else { const uint32_t st = i.rdp(va); u = i.rd<uint64_t>(st); i.wrp(va, st + 8); }
+            } else if (fpreg < 8) u = i.jit64->GetVector(fpreg++)[0];
+            else { u = i.rd<uint64_t>(sp); sp += 8; }
+            double v; std::memcpy(&v, &u, 8); return v;
         }
     };
     std::string format(const char* f, VarArgs va) {
@@ -413,7 +440,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
             if (*f == '*') { spec += std::to_string((int32_t)va.next32()); f++; } else while (std::isdigit((unsigned char)*f)) spec += *f++;
             if (*f == '.') { spec += *f++; if (*f == '*') { spec += std::to_string((int32_t)va.next32()); f++; } else while (std::isdigit((unsigned char)*f)) spec += *f++; }
             int lng = 0;   // 0 int, 2 long long
-            while (std::strchr("hlLzjt", *f)) { if (*f == 'l' && f[1] == 'l') { lng = 2; f += 2; } else { if (*f == 'L') lng = 3; f++; } }
+            while (std::strchr("hlLzjt", *f)) { if (*f == 'l' && f[1] == 'l') { lng = 2; f += 2; } else { if (*f == 'L') lng = 3; if (a64 && std::strchr("lzjt", *f)) lng = 2; f++; } }   // long and size_t are 64-bit on aarch64
             const char c = *f++;
             spec += (lng == 2 && std::strchr("diouxX", c)) ? std::string("ll") + c : std::string(1, c);
             switch (c) {
@@ -423,7 +450,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
             case 's': { const uint32_t p = va.next32(); std::snprintf(tmp, sizeof tmp, spec.c_str(), p ? str(p) : "(null)"); break; }
             case 'p': std::snprintf(tmp, sizeof tmp, "0x%x", va.next32()); break;
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-                const uint64_t u = va.next64(); double v; std::memcpy(&v, &u, 8);
+                double v = va.next_double();
                 if (lng == 3) spec.erase(spec.size() - 1, 1), spec += c;   // long double == double on armhf
                 std::snprintf(tmp, sizeof tmp, spec.c_str(), v); break;
             }
@@ -463,7 +490,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
                 const long v = (c == 'u' || base == 16 || base == 8) ? (long)std::strtoul(field, &e, base) : std::strtol(field, &e, base);
                 if (e == field) return n;
                 e = const_cast<char*>(s) + (e - field);
-                if (!skip) wr<uint32_t>(va.next32(), (uint32_t)v);
+                if (!skip) { const gaddr p = va.next32(); if (a64 && lng) wr<uint64_t>(p, (uint64_t)v); else wr<uint32_t>(p, (uint32_t)v); }
                 break; }
             case 'f': case 'g': case 'e': case 'a': case 'E': case 'G': {
                 const double v = std::strtod(field, &e);
@@ -536,13 +563,13 @@ std::vector<Entry> libc_table() {
     add("strchr", [](I& i) { const char* p = std::strchr(i.str(i.r(0)), (int)i.r(1)); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
     add("strrchr", [](I& i) { const char* p = std::strrchr(i.str(i.r(0)), (int)i.r(1)); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
     add("strstr", [](I& i) { const char* p = std::strstr(i.str(i.r(0)), i.str(i.r(1))); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
-    auto strtol_ = [](I& i) { char* e; const long v = std::strtol(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret((uint32_t)(int32_t)v); };
+    auto strtol_ = [](I& i) { char* e; const long v = std::strtol(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); if (i.a64) i.ret64((uint64_t)v); else i.ret((uint32_t)(int32_t)v); };
     add("strtol", strtol_);
     add("__isoc23_strtol", strtol_);
-    add("strtoul", [](I& i) { char* e; const unsigned long v = std::strtoul(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret((uint32_t)v); });
+    add("strtoul", [](I& i) { char* e; const unsigned long v = std::strtoul(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); if (i.a64) i.ret64((uint64_t)v); else i.ret((uint32_t)v); });
     add("__isoc23_strtoul", t.back().fn);
-    add("strtod", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
-    add("strtof", [](I& i) { char* e; const float v = std::strtof(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_f(v); });
+    add("strtod", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
+    add("strtof", [](I& i) { char* e; const float v = std::strtof(i.str(i.r(0)), &e); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_f(v); });
     add("atof", [](I& i) { i.ret_d(std::atof(i.str(i.r(0)))); });
     add("atoi", [](I& i) { i.ret((uint32_t)std::atoi(i.str(i.r(0)))); });
     add("getenv", [](I& i) { i.ret(0); });   // no environment for guests
@@ -561,9 +588,9 @@ std::vector<Entry> libc_table() {
     add("__printf_chk", [](I& i) { const std::string s = i.format(i.str(i.r(1)), {i, 2, i.r(13)}); std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
     // time
     add("__clock_gettime64", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int64_t>(p, ts.tv_sec); i.wr<int32_t>(p + 8, (int32_t)ts.tv_nsec); i.wr<int32_t>(p + 12, 0); i.ret(0); });
-    add("clock_gettime", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); i.wr<int32_t>(p, (int32_t)ts.tv_sec); i.wr<int32_t>(p + 4, (int32_t)ts.tv_nsec); i.ret(0); });
+    add("clock_gettime", [](I& i) { timespec ts; clock_gettime((clockid_t)i.r(0), &ts); const gaddr p = i.r(1); if (i.a64) { i.wr<int64_t>(p, ts.tv_sec); i.wr<int64_t>(p + 8, ts.tv_nsec); } else { i.wr<int32_t>(p, (int32_t)ts.tv_sec); i.wr<int32_t>(p + 4, (int32_t)ts.tv_nsec); } i.ret(0); });
     // threads: one guest thread, so locks are no-ops
-    add("pthread_mutex_init", [](I& i) { std::memset(i.m + i.r(0), 0, 24); if (i.r(1)) i.wr<uint32_t>(i.r(0) + 12, i.rd<uint32_t>(i.r(1))); i.ret(0); });
+    add("pthread_mutex_init", [](I& i) { std::memset(i.m + i.r(0), 0, i.a64 ? 48 : 24); if (i.r(1)) i.wr<uint32_t>(i.r(0) + i.kind_off(), i.rd<uint32_t>(i.r(1))); i.ret(0); });
     add("pthread_mutexattr_init", [](I& i) { i.wr<uint32_t>(i.r(0), 0); i.ret(0); });
     add("pthread_mutexattr_settype", [](I& i) { i.wr<uint32_t>(i.r(0), i.r(1)); i.ret(0); });
     for (const char* n : {"pthread_mutex_destroy", "pthread_mutexattr_destroy", "pthread_mutexattr_setprotocol"}) add(n, [](I& i) { i.ret(0); });
@@ -582,7 +609,7 @@ std::vector<Entry> libc_table() {
     add("pthread_cond_clockwait", [cond_wait](I& i) { cond_wait(i, true); });
     add("pthread_cond_signal", [](I& i) { for (auto& t : i.th) if (t->st == I::WaitCond && t->obj == i.r(0) && !t->signaled) { t->signaled = true; break; } i.ret(0); });
     add("pthread_cond_broadcast", [](I& i) { for (auto& t : i.th) if (t->st == I::WaitCond && t->obj == i.r(0)) t->signaled = true; i.ret(0); });
-    add("pthread_create", [](I& i) { const gaddr thr = i.r(0), fn = i.r(2), arg = i.r(3); const uint32_t id = i.th.size() + 1; i.wr<uint32_t>(thr, id); i.spawn(fn, arg); });
+    add("pthread_create", [](I& i) { const gaddr thr = i.r(0), fn = i.r(2), arg = i.r(3); const uint32_t id = i.th.size() + 1; i.wrp(thr, id); i.spawn(fn, arg); });
     add("pthread_join", [](I& i) {
         const uint32_t t = i.r(0); if (t < 1 || t > i.th.size()) { i.ret(3); return; }   // ESRCH
         i.me().join_ret = i.r(1); i.ret(0);
@@ -619,9 +646,9 @@ std::vector<Entry> libc_table() {
     add("nl_langinfo_l", [](I& i) { i.ret(i.cstr("")); });
     add("__nl_langinfo_l", [](I& i) { i.ret(i.cstr("")); });
     add("__ctype_get_mb_cur_max", [](I& i) { i.ret(1); });
-    add("__strtod_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
-    add("strtold_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
-    add("__strtof_l", [](I& i) { char* e; const float v = std::strtof(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_f(v); });
+    add("__strtod_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
+    add("strtold_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
+    add("__strtof_l", [](I& i) { char* e; const float v = std::strtof(i.str(i.r(0)), &e); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_f(v); });
     add("__strcoll_l", [](I& i) { i.ret((uint32_t)std::strcmp(i.str(i.r(0)), i.str(i.r(1)))); });
     add("__strxfrm_l", [](I& i) { const size_t n = std::strlen(i.str(i.r(1))); if (i.r(2) > n) std::strcpy(i.str(i.r(0)), i.str(i.r(1))); i.ret((uint32_t)n); });
     add("isspace", [](I& i) { i.ret(std::isspace((int)i.r(0)) ? 1 : 0); });
@@ -634,7 +661,7 @@ std::vector<Entry> libc_table() {
         add(n, [](I& i) { i.ret(0); });   // one thread: nothing to wait for or wake
     add("memchr", [](I& i) { const void* p = std::memchr(i.m + i.r(0), (int)i.r(1), i.r(2)); i.ret(p ? (uint32_t)(static_cast<const uint8_t*>(p) - i.m) : 0); });
     add("strdup", [](I& i) { i.ret(i.g.strdup(i.str(i.r(0)))); });
-    add("posix_memalign", [](I& i) { const gaddr p = i.malloc_(i.r(2) + i.r(1)); i.wr<uint32_t>(i.r(0), (p + i.r(1) - 1) & ~(i.r(1) - 1)); i.ret(0); });
+    add("posix_memalign", [](I& i) { const gaddr p = i.malloc_(i.r(2) + i.r(1)); i.wrp(i.r(0), (p + i.r(1) - 1) & ~(i.r(1) - 1)); i.ret(0); });
     add("__memcpy_chk", [](I& i) { std::memcpy(i.m + i.r(0), i.m + i.r(1), i.r(2)); i.ret(i.r(0)); });
     add("__memmove_chk", [](I& i) { std::memmove(i.m + i.r(0), i.m + i.r(1), i.r(2)); i.ret(i.r(0)); });
     add("__strcpy_chk", [](I& i) { std::strcpy(i.str(i.r(0)), i.str(i.r(1))); i.ret(i.r(0)); });
@@ -656,37 +683,37 @@ std::vector<Entry> libc_table() {
         i.ret(c ? 1 : 0); });
     add("wcrtomb", [](I& i) { if (!i.r(0)) { i.ret(1); return; } if (i.r(1) >= 128) { i.ret(0xFFFFFFFFu); return; } i.m[i.r(0)] = (uint8_t)i.r(1); i.ret(1); });
     add("mbsnrtowcs", [](I& i) {
-        const gaddr dst = i.r(0), src = i.r(1), nms = i.r(2), len = i.r(3); const gaddr s0 = i.rd<uint32_t>(src);
+        const gaddr dst = i.r(0), src = i.r(1), nms = i.r(2), len = i.r(3); const gaddr s0 = i.rdp(src);
         uint32_t n = 0;
         for (; n < nms && (!dst || n < len); n++) {
             const uint8_t c = i.m[s0 + n];
             if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
             if (dst) i.wr<uint32_t>(dst + 4 * n, c);
-            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+            if (!c) { if (dst) i.wrp(src, 0); i.ret(n); return; }
         }
-        if (dst) i.wr<uint32_t>(src, s0 + n);
+        if (dst) i.wrp(src, s0 + n);
         i.ret(n); });
     add("__mbsrtowcs_chk", [](I& i) {
-        const gaddr dst = i.r(0), src = i.r(1), len = i.r(2); const gaddr s0 = i.rd<uint32_t>(src);
+        const gaddr dst = i.r(0), src = i.r(1), len = i.r(2); const gaddr s0 = i.rdp(src);
         uint32_t n = 0;
         for (;; n++) {
             if (dst && n >= len) break;
             const uint8_t c = i.m[s0 + n];
             if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
             if (dst) i.wr<uint32_t>(dst + 4 * n, c);
-            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+            if (!c) { if (dst) i.wrp(src, 0); i.ret(n); return; }
         }
-        i.wr<uint32_t>(src, s0 + n); i.ret(n); });
+        i.wrp(src, s0 + n); i.ret(n); });
     add("wcsnrtombs", [](I& i) {
-        const gaddr dst = i.r(0), src = i.r(1), nwc = i.r(2), len = i.r(3); const gaddr s0 = i.rd<uint32_t>(src);
+        const gaddr dst = i.r(0), src = i.r(1), nwc = i.r(2), len = i.r(3); const gaddr s0 = i.rdp(src);
         uint32_t n = 0;
         for (; n < nwc && (!dst || n < len); n++) {
             const uint32_t c = i.rd<uint32_t>(s0 + 4 * n);
             if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
             if (dst) i.m[dst + n] = (uint8_t)c;
-            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+            if (!c) { if (dst) i.wrp(src, 0); i.ret(n); return; }
         }
-        if (dst) i.wr<uint32_t>(src, s0 + 4 * n);
+        if (dst) i.wrp(src, s0 + 4 * n);
         i.ret(n); });
     add("wmemchr", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) if (i.rd<uint32_t>(i.r(0) + 4 * k) == i.r(1)) { i.ret(i.r(0) + 4 * k); return; } i.ret(0); });
     add("wmemcmp", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) { const uint32_t a = i.rd<uint32_t>(i.r(0) + 4 * k), b = i.rd<uint32_t>(i.r(1) + 4 * k); if (a != b) { i.ret(a < b ? 0xFFFFFFFFu : 1); return; } } i.ret(0); });
@@ -707,7 +734,7 @@ std::vector<Entry> libc_table() {
     for (const char* n : {"symlink", "link", "chown", "chmod", "fchmod", "fchmodat", "truncate64"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("rand", [](I& i) { i.ret((uint32_t)std::rand()); });
     add("srand", [](I& i) { std::srand(i.r(0)); });
-    add("time", [](I& i) { const uint32_t t = (uint32_t)std::time(nullptr); if (i.r(0)) i.wr<uint32_t>(i.r(0), t); i.ret(t); });
+    add("time", [](I& i) { const uint32_t t = (uint32_t)std::time(nullptr); if (i.r(0)) { if (i.a64) i.wr<uint64_t>(i.r(0), t); else i.wr<uint32_t>(i.r(0), t); } i.ret(t); });
     // single-import stoppers found by the survey: calls that can fail or do nothing for a sandboxed guest
     add("frexpf", [](I& i) { int e; const float v = std::frexp(i.s(0), &e); i.wr<int32_t>(i.r(0), e); i.ret_f(v); });
     add("fma", [](I& i) { i.ret_d(std::fma(i.d(0), i.d(1), i.d(2))); });
@@ -719,15 +746,15 @@ std::vector<Entry> libc_table() {
         add(n, [](I& i) { i.ret(0); });
     for (const char* n : {"getrlimit", "snd_seq_open"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     add("strtok_r", [](I& i) {
-        gaddr p = i.r(0) ? i.r(0) : i.rd<uint32_t>(i.r(2));
+        gaddr p = i.r(0) ? i.r(0) : i.rdp(i.r(2));
         const char* delim = i.str(i.r(1));
         if (!p) { i.ret(0); return; }
         while (i.m[p] && std::strchr(delim, i.m[p])) p++;
-        if (!i.m[p]) { i.wr<uint32_t>(i.r(2), p); i.ret(0); return; }
+        if (!i.m[p]) { i.wrp(i.r(2), p); i.ret(0); return; }
         const gaddr tok = p;
         while (i.m[p] && !std::strchr(delim, i.m[p])) p++;
         if (i.m[p]) { i.m[p] = 0; p++; }
-        i.wr<uint32_t>(i.r(2), p);
+        i.wrp(i.r(2), p);
         i.ret(tok); });
     add("strftime", [](I& i) { if (i.r(1)) i.m[i.r(0)] = 0; i.ret(0); });   // no clock formatting: an empty string
     for (const char* n : {"setrlimit", "pthread_attr_setstacksize", "pthread_attr_setdetachstate"}) add(n, [](I& i) { i.ret(0); });
@@ -736,7 +763,7 @@ std::vector<Entry> libc_table() {
     add("bcmp", [](I& i) { i.ret((uint32_t)std::memcmp(i.m + i.r(0), i.m + i.r(1), i.r(2))); });
     for (const char* n : {"pthread_getschedparam", "pthread_getattr_np", "pthread_attr_getstack", "pthread_attr_getguardsize", "sched_getaffinity"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
     for (const char* n : {"socketpair", "socket", "pipe"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
-    add("gettimeofday", [](I& i) { timeval tv; gettimeofday(&tv, nullptr); if (i.r(0)) { i.wr<int32_t>(i.r(0), (int32_t)tv.tv_sec); i.wr<int32_t>(i.r(0) + 4, (int32_t)tv.tv_usec); } i.ret(0); });
+    add("gettimeofday", [](I& i) { timeval tv; gettimeofday(&tv, nullptr); if (i.r(0)) { if (i.a64) { i.wr<int64_t>(i.r(0), tv.tv_sec); i.wr<int64_t>(i.r(0) + 8, tv.tv_usec); } else { i.wr<int32_t>(i.r(0), (int32_t)tv.tv_sec); i.wr<int32_t>(i.r(0) + 4, (int32_t)tv.tv_usec); } } i.ret(0); });
     // ARM EHABI: the unwinder asks which exception index table covers a pc (glibc provides this, built on dl_iterate_phdr)
     add("__gnu_Unwind_Find_exidx", [](I& i) {
         for (auto& md : i.mods) if (i.r(0) >= md.base && i.r(0) < md.end && md.exidx) { if (i.r(1)) i.wr<uint32_t>(i.r(1), md.exidx_size / 8); i.ret(md.exidx); return; }
@@ -765,8 +792,8 @@ std::vector<Entry> libc_table() {
     add("feof", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::feof(f) : 1); });
     add("ferror", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::ferror(f) : 1); });
     add("rewind", [](I& i) { if (FILE* f = i.file_of(i.r(0))) std::rewind(f); });
-    add("fseek", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::fseek(f, (int32_t)i.r(1), (int)i.r(2)) : 0xFFFFFFFFu); });
-    add("ftell", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret(f ? (uint32_t)std::ftell(f) : 0xFFFFFFFFu); });
+    add("fseek", [](I& i) { FILE* f = i.file_of(i.r(0)); const long off = i.a64 ? (long)i.x(1) : (long)(int32_t)i.r(1); i.ret(f ? (uint32_t)std::fseek(f, off, (int)i.r(2)) : 0xFFFFFFFFu); });
+    add("ftell", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret64(f ? (uint64_t)(int64_t)std::ftell(f) : ~0ull); });
     add("fseeko64", [](I& i) { FILE* f = i.file_of(i.r(0)); const int64_t off = (int64_t)((uint64_t)i.r(2) | (uint64_t)i.r(3) << 32); i.ret(f ? (uint32_t)fseeko(f, off, (int)i.arg(4)) : 0xFFFFFFFFu); });
     add("ftello64", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret64(f ? (uint64_t)ftello(f) : ~0ull); });
     add("fprintf", [](I& i) { const std::string s = i.format(i.str(i.r(1)), {i, 2, i.r(13)}); if (FILE* f = i.file_of(i.r(0))) std::fputs(s.c_str(), f); else std::fprintf(stderr, "[guest] %s", s.c_str()); i.ret((uint32_t)s.size()); });
@@ -793,10 +820,13 @@ std::vector<Entry> libc_table() {
     add("getcwd", [](I& i) { if (i.r(1) < 2) { i.ret(0); return; } std::memcpy(i.m + i.r(0), "/", 2); i.ret(i.r(0)); });
     // armhf `struct stat` (88 bytes, 32-bit st_size at 44) for __xstat/__lxstat/__fxstat, and `struct stat64` (st_size 64-bit at 48) for the *64 forms
     auto put_stat = [](I& i, gaddr a, const struct stat& st, int mode) {   // mode 0: stat, 1: stat64, 2: stat with 64-bit times (glibc 2.34+, 112 bytes)
-        std::memset(i.m + a, 0, mode == 0 ? 88 : mode == 1 ? 104 : 112);   // exactly the guest struct: it sits on the guest stack
+        std::memset(i.m + a, 0, mode == 0 ? 88 : mode == 1 ? 104 : mode == 2 ? 112 : 128);   // exactly the guest struct: it sits on the guest stack
         i.wr<uint32_t>(a + 16, st.st_mode); i.wr<uint32_t>(a + 20, (uint32_t)st.st_nlink); i.wr<uint32_t>(a + 24, st.st_uid); i.wr<uint32_t>(a + 28, st.st_gid);
         i.wr<uint64_t>(a, st.st_dev); i.wr<uint64_t>(a + 32, st.st_rdev);
-        if (mode == 2) {
+        if (mode == 3) {   // aarch64 struct stat: ino +8, size +48, blksize +56, blocks +64, three {sec, nsec} pairs of 64-bit words from +72
+            i.wr<uint64_t>(a + 8, st.st_ino); i.wr<uint64_t>(a + 48, (uint64_t)st.st_size); i.wr<uint32_t>(a + 56, (uint32_t)st.st_blksize); i.wr<uint64_t>(a + 64, (uint64_t)st.st_blocks);
+            i.wr<int64_t>(a + 72, st.st_atime); i.wr<int64_t>(a + 88, st.st_mtime); i.wr<int64_t>(a + 104, st.st_ctime);
+        } else if (mode == 2) {
             i.wr<uint64_t>(a + 8, st.st_ino); i.wr<uint64_t>(a + 40, (uint64_t)st.st_size); i.wr<uint32_t>(a + 48, (uint32_t)st.st_blksize); i.wr<uint64_t>(a + 56, (uint64_t)st.st_blocks);
             i.wr<int64_t>(a + 64, st.st_atime); i.wr<int64_t>(a + 80, st.st_mtime); i.wr<int64_t>(a + 96, st.st_ctime);
         } else if (mode == 1) {
@@ -812,7 +842,7 @@ std::vector<Entry> libc_table() {
         add(n, [mode, lst, put_stat](I& i) {
             std::string hp; if (!i.hostpath(i.str(i.r(1)), hp)) { i.ret(i.fail(2)); return; }
             struct stat st; if ((lst ? ::lstat(hp.c_str(), &st) : ::stat(hp.c_str(), &st)) != 0) { i.ret(i.fail(errno)); return; }
-            put_stat(i, i.r(2), st, mode); i.ret(0); });
+            put_stat(i, i.r(2), st, i.a64 ? 3 : mode); i.ret(0); });
     }
     for (const char* n : {"__stat64_time64", "__lstat64_time64"}) {   // (path, buf)
         const bool lst = std::strstr(n, "lstat") != nullptr;
@@ -823,8 +853,20 @@ std::vector<Entry> libc_table() {
     }
     for (const char* n : {"__fxstat", "__fxstat64"}) {
         const int mode = std::strstr(n, "64") != nullptr ? 1 : 0;
-        add(n, [mode, put_stat](I& i) { struct stat st; if (::fstat((int)i.r(1), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(2), st, mode); i.ret(0); });
+        add(n, [mode, put_stat](I& i) { struct stat st; if (::fstat((int)i.r(1), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(2), st, i.a64 ? 3 : mode); i.ret(0); });
     }
+    for (const char* n : {"stat", "stat64", "lstat", "lstat64"}) {   // aarch64 glibc exports these directly (older glibc via __xstat)
+        const bool lst = n[0] == 'l';
+        add(n, [lst, put_stat](I& i) {
+            std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(i.fail(2)); return; }
+            struct stat st; if ((lst ? ::lstat(hp.c_str(), &st) : ::stat(hp.c_str(), &st)) != 0) { i.ret(i.fail(errno)); return; }
+            put_stat(i, i.r(1), st, 3); i.ret(0); });
+    }
+    for (const char* n : {"fstat", "fstat64"}) add(n, [put_stat](I& i) { struct stat st; if (::fstat((int)i.r(0), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(1), st, 3); i.ret(0); });
+    // long and off_t are 64-bit on aarch64: offsets come in whole registers
+    add("fseeko", [](I& i) { FILE* f = i.file_of(i.r(0)); const int64_t off = i.a64 ? (int64_t)i.x(1) : (int32_t)i.r(1); i.ret(f ? (uint32_t)fseeko(f, off, (int)i.r(2)) : 0xFFFFFFFFu); });
+    add("ftello", [](I& i) { FILE* f = i.file_of(i.r(0)); i.ret64(f ? (uint64_t)ftello(f) : ~0ull); });
+    add("lseek", [](I& i) { const int64_t off = i.a64 ? (int64_t)i.x(1) : (int32_t)i.r(1); i.ret64((uint64_t)::lseek((int)i.r(0), off, (int)i.r(2))); });
     add("__fstat64_time64", [put_stat](I& i) { struct stat st; if (::fstat((int)i.r(0), &st) != 0) { i.ret(i.fail(errno)); return; } put_stat(i, i.r(1), st, 2); i.ret(0); });
     // fscanf: read ahead into a buffer, scan it, and seek back over what was not consumed (regular files)
     auto fscanf_ = [](I& i) {
@@ -846,17 +888,18 @@ std::vector<Entry> libc_table() {
         if (is64) { i.wr<uint64_t>(b, e->d_ino); i.wr<uint16_t>(b + 16, 280); i.m[b + 18] = e->d_type; std::strncpy((char*)i.m + b + 19, e->d_name, 255); }
         else { i.wr<uint32_t>(b, (uint32_t)e->d_ino); i.wr<uint16_t>(b + 8, 280); i.m[b + 10] = e->d_type; std::strncpy((char*)i.m + b + 11, e->d_name, 255); }
         i.ret(b); };
-    add("readdir", [readdir_](I& i) { readdir_(i, false); });
+    add("readdir", [readdir_](I& i) { readdir_(i, i.a64); });   // aarch64 has only the 64-bit dirent
     add("readdir64", [readdir_](I& i) { readdir_(i, true); });
     add("closedir", [](I& i) { auto it = i.dirs.find(i.r(0)); if (it != i.dirs.end()) { ::closedir(it->second); i.dirs.erase(it); i.free_(i.r(0)); } i.ret(0); });
     // glob_t (armhf): gl_pathc +0, gl_pathv +4, gl_offs +8
     auto glob_ = [](I& i) {
         std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.ret(3); return; }
         glob_t g{}; if (::glob(hp.c_str(), 0, nullptr, &g) != 0) { i.ret(3); return; }   // GLOB_NOMATCH
-        const gaddr vec = i.malloc_(4 * ((uint32_t)g.gl_pathc + 1));
-        for (size_t k = 0; k < g.gl_pathc; k++) i.wr<uint32_t>(vec + 4 * (uint32_t)k, i.g.strdup(i.guestpath(g.gl_pathv[k]).c_str()));
-        i.wr<uint32_t>(vec + 4 * (uint32_t)g.gl_pathc, 0);
-        i.wr<uint32_t>(i.r(3), (uint32_t)g.gl_pathc); i.wr<uint32_t>(i.r(3) + 4, vec); i.wr<uint32_t>(i.r(3) + 8, 0);
+        const uint32_t ps = i.a64 ? 8 : 4;   // glob_t: gl_pathc, gl_pathv, gl_offs, each pointer-sized
+        const gaddr vec = i.malloc_(ps * ((uint32_t)g.gl_pathc + 1));
+        for (size_t k = 0; k < g.gl_pathc; k++) i.wrp(vec + ps * (uint32_t)k, i.g.strdup(i.guestpath(g.gl_pathv[k]).c_str()));
+        i.wrp(vec + ps * (uint32_t)g.gl_pathc, 0);
+        i.wrp(i.r(3), (uint32_t)g.gl_pathc); i.wrp(i.r(3) + ps, vec); i.wrp(i.r(3) + 2 * ps, 0);
         globfree(&g); i.ret(0); };
     for (const char* n : {"glob", "glob64", "__glob64_time64"}) add(n, glob_);
     for (const char* n : {"globfree", "globfree64", "__globfree64_time64"}) add(n, [](I& i) { i.ret(0); });   // the vectors are left in the guest heap
@@ -866,13 +909,57 @@ std::vector<Entry> libc_table() {
             if (i.r(0) < i.mods[k].base || i.r(0) >= i.mods[k].end) continue;
             const std::string nm = std::filesystem::path(i.mod_paths[k]).filename().string();
             const bool is_lib = k + 1 < i.mods.size() && std::getenv("MPC_HOST_LIBS");   // libraries load before the plugin
-            i.wr<uint32_t>(i.r(1), i.g.strdup(((is_lib ? "/lib/" : "/plugin/") + nm).c_str())); i.wr<uint32_t>(i.r(1) + 4, i.mods[k].base); i.wr<uint32_t>(i.r(1) + 8, 0); i.wr<uint32_t>(i.r(1) + 12, 0);
+            const uint32_t ps = i.a64 ? 8 : 4; i.wrp(i.r(1), i.g.strdup(((is_lib ? "/lib/" : "/plugin/") + nm).c_str())); i.wrp(i.r(1) + ps, i.mods[k].base); i.wrp(i.r(1) + 2 * ps, 0); i.wrp(i.r(1) + 3 * ps, 0);
             i.ret(1); return;
         }
         i.ret(0); });
     for (const char* n : {"getpwnam", "getpwuid", "getenv_s"}) add(n, [](I& i) { i.ret(0); });   // no user database
+    // --- process and system queries, memory mapping, text and spawn stubs (both architectures) ---
+    for (const char* n : {"getauxval", "__getauxval"}) add(n, [](I& i) { i.ret(0); });
+    add("getpid", [](I& i) { i.ret(1000); });
+    add("getpagesize", [](I& i) { i.ret(4096); });
+    add("sysconf", [](I& i) { const uint32_t n = i.r(0); i.ret(n == 30 ? 4096 : n == 84 || n == 83 ? 1 : n == 2 ? 100 : 0xFFFFFFFFu); });   // _SC_PAGESIZE, _SC_NPROCESSORS_*, _SC_CLK_TCK
+    add("get_nprocs", [](I& i) { i.ret(1); });
+    add("mmap", [](I& i) {   // anonymous mappings only, from the guest heap, page aligned
+        const uint32_t len = i.r(1), flags = i.r(3);
+        if (!(flags & 0x20) || len == 0) { i.ret(i.fail(19)); return; }   // MAP_ANONYMOUS (0x20 on armhf and aarch64)
+        const gaddr p = i.malloc_(len + 4096);
+        if (!p) { i.ret(i.fail(12)); return; }
+        const gaddr a = (p + 4095) & ~4095u; std::memset(i.m + a, 0, len); i.ret(a); });
+    for (const char* n : {"munmap", "mprotect", "mlock", "munlock", "madvise", "msync"}) add(n, [](I& i) { i.ret(0); });
+    add("toupper", [](I& i) { i.ret((uint32_t)std::toupper((int)i.r(0))); });
+    add("tolower", [](I& i) { i.ret((uint32_t)std::tolower((int)i.r(0))); });
+    add("strcspn", [](I& i) { i.ret((uint32_t)std::strcspn(i.str(i.r(0)), i.str(i.r(1)))); });
+    add("strspn", [](I& i) { i.ret((uint32_t)std::strspn(i.str(i.r(0)), i.str(i.r(1)))); });
+    add("gettext", [](I& i) { i.ret(i.r(0)); });
+    add("dgettext", [](I& i) { i.ret(i.r(1)); });
+    for (const char* n : {"bindtextdomain", "bind_textdomain_codeset", "textdomain"}) add(n, [](I& i) { i.ret(0); });
+    add("arc4random", [](I& i) { i.ret((uint32_t)std::rand()); });
+    add("getentropy", [](I& i) { for (uint32_t k = 0; k < i.r(1); k++) i.m[i.r(0) + k] = (uint8_t)std::rand(); i.ret(0); });
+    for (const char* n : {"ftruncate", "ftruncate64", "writev", "ioctl", "waitpid", "iconv_open", "shm_open", "shm_unlink", "posix_spawn", "unlink", "fdopen", "fileno"})
+        add(n, [](I& i) { i.ret(i.fail(38)); });   // ENOSYS
+    for (const char* n : {"posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy", "posix_spawn_file_actions_addopen", "iconv_close"}) add(n, [](I& i) { i.ret(0); });
+    // glibc 2.35+: struct dl_find_object { u64 flags; void *map_start, *map_end, *link_map, *eh_frame; ... } (aarch64 layout); libgcc's unwinder uses it
+    add("_dl_find_object", [](I& i) {
+        for (auto& md : i.mods) if (i.r(0) >= md.base && i.r(0) < md.end && md.eh) {
+            const gaddr r = i.r(1); std::memset(i.m + r, 0, 64);
+            i.wr<uint64_t>(r + 8, md.base); i.wr<uint64_t>(r + 16, md.end); i.wr<uint64_t>(r + 32, md.eh);
+            i.ret(0); return;
+        }
+        i.ret(0xFFFFFFFFu); });
+    add("mbsrtowcs", [](I& i) {
+        const gaddr dst = i.r(0), src = i.r(1), len = i.r(2); const gaddr s0 = i.rdp(src);
+        uint32_t n = 0;
+        for (;; n++) {
+            if (dst && n >= len) break;
+            const uint8_t c = i.m[s0 + n];
+            if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
+            if (dst) i.wr<uint32_t>(dst + 4 * n, c);
+            if (!c) { if (dst) i.wrp(src, 0); i.ret(n); return; }
+        }
+        i.wrp(src, s0 + n); i.ret(n); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
-    add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
+    add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); const uint32_t off = i.rd<uint32_t>(ti + (i.a64 ? 8 : 4)); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + off); });   // tls_index {module, offset}
     // C++ runtime
     for (const char* n : {"_Znwj", "_Znaj", "_ZnwjRKSt9nothrow_t", "_ZnajRKSt9nothrow_t"})
         add(n, [](I& i) { i.ret(i.malloc_(i.r(0))); });
@@ -907,7 +994,42 @@ std::vector<Entry> libc_table() {
 }
 
 // Imports that are data, not code.
-bool is_data_import(const std::string& n) { return n == "__stack_chk_guard" || n == "_ZSt7nothrow" || n == "stderr" || n == "stdout"; }
+bool is_data_import(const std::string& n) { return n == "__libc_single_threaded" || n == "__stack_chk_guard" || n == "_ZSt7nothrow" || n == "stderr" || n == "stdout"; }
+}  // namespace
+
+namespace {
+// One import of a module being loaded: a symbol of a module loaded earlier, a data object, a table thunk, or an abort stub (recorded in `missing`).
+gaddr resolve_import(I& i, std::vector<std::string>& missing, std::unordered_map<std::string, Thunk>& table, const std::string& name, bool weak) {
+    if (auto d = i.dynsyms.find(name); d != i.dynsyms.end()) return d->second;   // a library loaded before this one
+    if (is_data_import(name)) {
+        auto& da = i.data_by_name[name];
+        if (da) return da;
+        const gaddr a = da = i.data(64);
+        if (name == "__stack_chk_guard") { i.wr<uint32_t>(a, 0xC0FFEE00u); if (i.a64) i.wr<uint32_t>(a + 4, 0xC0FFEE00u); }
+        if (name == "__libc_single_threaded") i.m[a] = 0;   // threads exist (cooperative), so report "not single threaded"
+        return a;
+    }
+    if ((name == "__ctype_b_loc" || name == "__ctype_tolower_loc" || name == "__ctype_toupper_loc") && !i.thunk_by_name.count(name)) {
+        // glibc's tables are indexed from -128; armhf, aarch64 and x86-64 glibc are little-endian with the same contents
+        const bool b = name == "__ctype_b_loc"; const uint32_t esz = b ? 2 : 4;
+        const gaddr tbl = i.data(384 * esz, 8), pp = i.data(8, 8);
+        if (b) std::memcpy(i.m + tbl, *__ctype_b_loc() - 128, 384 * esz);
+        else std::memcpy(i.m + tbl, (name == "__ctype_tolower_loc" ? *__ctype_tolower_loc() : *__ctype_toupper_loc()) - 128, 384 * esz);
+        i.wrp(pp, tbl + 128 * esz);
+        return i.thunk_for(name, [pp](I& ii) { ii.ret(pp); });
+    }
+    if (name == "pthread_once") {   // guest code, so the init routine runs without a nested call: if (!*once) { *once = 1; tail-call init }
+        if (auto t = i.thunk_by_name.find(name); t != i.thunk_by_name.end()) return t->second;
+        return i.thunk_by_name[name] = i.a64
+            ? i.stub({0xB9400002, 0x35000082, 0x52800022, 0xB9000002, 0xD61F0020, 0xD65F03C0})   // ldr w2,[x0]; cbnz w2,ret; mov w2,#1; str w2,[x0]; br x1; ret
+            : i.stub({0xE5902000, 0xE3520000, 0x112FFF1E, 0xE3A02001, 0xE5802000, 0xE12FFF11});
+    }
+    auto it = table.find(name);
+    if (it != table.end()) return i.thunk_for(name, it->second);
+    if (weak) return 0;
+    missing.push_back(name);
+    return i.thunk_for(name, [name](I& ii) { abort_named(ii, name); });
+}
 }  // namespace
 
 Guest::Guest(bool a64) {
@@ -1037,15 +1159,16 @@ float Guest::call_f(gaddr fn, const std::vector<uint32_t>& ints, const std::vect
 }
 
 bool Guest::load(const std::string& path) {
+    if (impl_->a64) return load64(path);
     I& i = *impl_;
     const gaddr bias = i.load_next;
     std::ifstream f(path, std::ios::binary);
     if (!f) { err_ = "cannot open " + path; return false; }
     std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
     if (file.size() < sizeof(Elf32_Ehdr)) { err_ = "not an ELF file"; return false; }
-    const auto* eh = reinterpret_cast<const Elf32_Ehdr*>(file.data());
+    const auto* eh = reinterpret_cast<const Elf32_Ehdr*>(file.data());   // (an aarch64 file is refused below: use Guest(true))
     if (std::memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_machine != EM_ARM || eh->e_type != ET_DYN) {
-        err_ = "not a 32-bit ARM shared object (a Gen2 aarch64 build needs the A64 front end)"; return false;
+        err_ = "not a 32-bit ARM shared object (an aarch64 build needs Guest(true))"; return false;
     }
     const auto* ph = reinterpret_cast<const Elf32_Phdr*>(file.data() + eh->e_phoff);
     const Elf32_Dyn* dyn = nullptr;
@@ -1113,32 +1236,7 @@ bool Guest::load(const std::string& path) {
             continue;
         }
         if (name.empty()) continue;
-        if (auto d = i.dynsyms.find(name); d != i.dynsyms.end()) { symaddr[k] = d->second; continue; }   // a library loaded before this one
-        if (is_data_import(name)) {
-            auto& da = i.data_by_name[name];
-            if (da) { symaddr[k] = da; continue; }
-            const gaddr a = da = i.data(64);
-            if (name == "__stack_chk_guard") i.wr<uint32_t>(a, 0xC0FFEE00u);
-            symaddr[k] = a;
-            continue;
-        }
-        if (name == "__ctype_b_loc" && !i.thunk_by_name.count(name)) {
-            // glibc's table is indexed from -128; both armhf and x86-64 glibc are little-endian with the same bits
-            const gaddr tbl = i.data(384 * 2, 4), pp = i.data(4, 4);
-            std::memcpy(mem_ + tbl, *__ctype_b_loc() - 128, 384 * 2);
-            i.wr<uint32_t>(pp, tbl + 256);
-            symaddr[k] = i.thunk_for(name, [pp](I& ii) { ii.ret(pp); });
-            continue;
-        }
-        if (name == "pthread_once") {   // guest code, so the init routine runs without a nested call: if (!*once) { *once = 1; tail-call init }
-            symaddr[k] = i.thunk_by_name.count(name) ? i.thunk_by_name[name] : (i.thunk_by_name[name] = i.stub({0xE5902000, 0xE3520000, 0x112FFF1E, 0xE3A02001, 0xE5802000, 0xE12FFF11}));
-            continue;
-        }
-        auto it = table.find(name);
-        if (it != table.end()) { symaddr[k] = i.thunk_for(name, it->second); continue; }
-        if (ELF32_ST_BIND(syms[k].st_info) == STB_WEAK) { symaddr[k] = 0; continue; }
-        missing_.push_back(name);
-        symaddr[k] = i.thunk_for(name, [name](I& ii) { abort_named(ii, name); });
+        symaddr[k] = resolve_import(i, missing_, table, name, ELF32_ST_BIND(syms[k].st_info) == STB_WEAK);
     }
 
     for (size_t k = missing_before; k < missing_.size(); k++) std::fprintf(stderr, "  no thunk for import: %s\n", missing_[k].c_str());
@@ -1169,6 +1267,118 @@ bool Guest::load(const std::string& path) {
     for (uint32_t k = 0; k < init_arraysz / 4; k++) {
         const gaddr fn = i.rd<uint32_t>(bias + init_array + 4 * k);
         if (fn && fn != 0xffffffffu) call(fn, {});
+    }
+    return true;
+}
+
+// The aarch64 loader: ELF64 shared objects with RELA relocations; TLS variant 1 with a 16-byte TCB (TPIDR_EL0 = kTp).
+bool Guest::load64(const std::string& path) {
+    I& i = *impl_;
+    const gaddr bias = i.load_next;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err_ = "cannot open " + path; return false; }
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
+    if (file.size() < sizeof(Elf64_Ehdr)) { err_ = "not an ELF file"; return false; }
+    const auto* eh = reinterpret_cast<const Elf64_Ehdr*>(file.data());
+    if (std::memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_AARCH64 || eh->e_type != ET_DYN) {
+        err_ = "not a 64-bit aarch64 shared object (an armhf build needs Guest(false))"; return false;
+    }
+    const auto* ph = reinterpret_cast<const Elf64_Phdr*>(file.data() + eh->e_phoff);
+    const Elf64_Dyn* dyn = nullptr;
+    uint64_t end = 0, eh_frame = 0; uint32_t tls_id = 0;
+    for (int k = 0; k < eh->e_phnum; k++) {
+        if (ph[k].p_type == PT_GNU_EH_FRAME) eh_frame = ph[k].p_vaddr;
+        if (ph[k].p_type == PT_LOAD) {
+            end = std::max<uint64_t>(end, ph[k].p_vaddr + ph[k].p_memsz);
+            if (bias + ph[k].p_vaddr + ph[k].p_memsz >= 0x70000000u) { err_ = "module does not fit below 1.75 GB"; return false; }
+            std::memcpy(mem_ + bias + ph[k].p_vaddr, file.data() + ph[k].p_offset, ph[k].p_filesz);
+            std::memset(mem_ + bias + ph[k].p_vaddr + ph[k].p_filesz, 0, ph[k].p_memsz - ph[k].p_filesz);
+        } else if (ph[k].p_type == PT_TLS) {
+            const uint32_t al = (uint32_t)std::max<uint64_t>(ph[k].p_align, 1);
+            i.tls_used = (i.tls_used + al - 1) / al * al;
+            const gaddr blk = kTp + 16 + i.tls_used;
+            if (blk + ph[k].p_memsz > kLoad) { err_ = "TLS area full"; return false; }
+            std::memset(mem_ + blk, 0, ph[k].p_memsz);
+            std::memcpy(mem_ + blk, file.data() + ph[k].p_offset, ph[k].p_filesz);
+            i.tls.push_back({blk, i.tls_used});
+            i.tls_used += (uint32_t)ph[k].p_memsz;
+            tls_id = (uint32_t)i.tls.size();
+        } else if (ph[k].p_type == PT_DYNAMIC) dyn = reinterpret_cast<const Elf64_Dyn*>(mem_ + bias + ph[k].p_vaddr);
+    }
+    if (!dyn) { err_ = "no PT_DYNAMIC"; return false; }
+    i.load_next = (bias + (uint32_t)end + 0xFFFFu) & ~0xFFFFu;
+    i.mods.push_back({bias, bias + (uint32_t)end, 0, 0, eh_frame ? bias + (uint32_t)eh_frame : 0});
+    i.mod_paths.push_back(path);
+    if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + (uint32_t)end);
+    i.plugin_dir = std::filesystem::path(path).parent_path().string();
+    uint64_t symtab = 0, strtab = 0, rela = 0, relasz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
+    for (const Elf64_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_SYMTAB: symtab = d->d_un.d_ptr; break;
+        case DT_STRTAB: strtab = d->d_un.d_ptr; break;
+        case DT_RELA: rela = d->d_un.d_ptr; break;
+        case DT_RELASZ: relasz = d->d_un.d_val; break;
+        case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
+        case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+        case DT_INIT: init = d->d_un.d_ptr; break;
+        case DT_INIT_ARRAY: init_array = d->d_un.d_ptr; break;
+        case DT_INIT_ARRAYSZ: init_arraysz = d->d_un.d_val; break;
+        case DT_REL: err_ = "REL relocations (not aarch64)"; return false;
+        case 36 /* DT_RELR */: err_ = "DT_RELR relative relocations are not supported yet"; return false;
+        }
+    }
+    uint32_t nsyms = 0;
+    const auto* sh = reinterpret_cast<const Elf64_Shdr*>(file.data() + eh->e_shoff);
+    for (int k = 0; k < eh->e_shnum; k++) if (sh[k].sh_type == SHT_DYNSYM) nsyms = (uint32_t)(sh[k].sh_size / sizeof(Elf64_Sym));
+    const auto* syms = reinterpret_cast<const Elf64_Sym*>(mem_ + bias + symtab);
+    const char* strs = reinterpret_cast<const char*>(mem_ + bias + strtab);
+
+    std::unordered_map<std::string, Thunk> table;
+    for (auto& e : libc_table()) table.emplace(e.name, std::move(e.fn));
+    std::vector<gaddr> symaddr(nsyms, 0);
+    const size_t missing_before = missing_.size();
+    for (uint32_t k = 1; k < nsyms; k++) {
+        const std::string name = strs + syms[k].st_name;
+        if (syms[k].st_shndx != SHN_UNDEF) {
+            symaddr[k] = bias + (uint32_t)syms[k].st_value;
+            if (ELF64_ST_TYPE(syms[k].st_info) == STT_TLS) symaddr[k] = (uint32_t)syms[k].st_value;   // an offset in this module's TLS block
+            if (ELF64_ST_BIND(syms[k].st_info) != STB_LOCAL && ELF64_ST_TYPE(syms[k].st_info) != STT_TLS) i.dynsyms.emplace(name, symaddr[k]);
+            continue;
+        }
+        if (name.empty()) continue;
+        symaddr[k] = resolve_import(i, missing_, table, name, ELF64_ST_BIND(syms[k].st_info) == STB_WEAK);
+    }
+    for (size_t k = missing_before; k < missing_.size(); k++) std::fprintf(stderr, "  no thunk for import: %s\n", missing_[k].c_str());
+
+    // a TLS descriptor's resolver is guest code that returns the offset stored next to it: ldr x0,[x0,#8]; ret
+    const gaddr tlsdesc_stub = i.thunk_by_name.count("<tlsdesc>") ? i.thunk_by_name["<tlsdesc>"] : (i.thunk_by_name["<tlsdesc>"] = i.stub({0xF9400400, 0xD65F03C0}));
+    auto apply = [&](uint64_t at, uint64_t size) -> bool {
+        for (uint64_t off = 0; off < size; off += sizeof(Elf64_Rela)) {
+            const auto* rr = reinterpret_cast<const Elf64_Rela*>(mem_ + bias + at + off);
+            const uint32_t type = ELF64_R_TYPE(rr->r_info), sym = ELF64_R_SYM(rr->r_info);
+            const gaddr P = bias + (uint32_t)rr->r_offset;
+            const uint64_t S = sym < nsyms ? symaddr[sym] : 0, A = (uint64_t)rr->r_addend;
+            const uint64_t tpoff = 16 + (tls_id ? i.tls[tls_id - 1].off : 0);
+            switch (type) {
+            case R_AARCH64_RELATIVE: i.wr<uint64_t>(P, bias + A); break;
+            case R_AARCH64_GLOB_DAT: case R_AARCH64_JUMP_SLOT: i.wr<uint64_t>(P, S + A); break;
+            case R_AARCH64_ABS64: i.wr<uint64_t>(P, S + A); break;
+            case R_AARCH64_NONE: break;
+            case R_AARCH64_TLS_DTPMOD: i.wr<uint64_t>(P, tls_id); break;
+            case R_AARCH64_TLS_DTPREL: i.wr<uint64_t>(P, S + A); break;
+            case R_AARCH64_TLS_TPREL: i.wr<uint64_t>(P, S + A + tpoff); break;
+            case R_AARCH64_TLSDESC: i.wr<uint64_t>(P, tlsdesc_stub); i.wr<uint64_t>(P + 8, S + A + tpoff); break;
+            default: err_ = "unsupported relocation type " + std::to_string(type); return false;
+            }
+        }
+        return true;
+    };
+    if (!apply(rela, relasz) || !apply(jmprel, pltrelsz)) return false;
+
+    if (init) call(bias + (uint32_t)init, {});
+    for (uint64_t k = 0; k < init_arraysz / 8; k++) {
+        const uint64_t fn = i.rd<uint64_t>(bias + (uint32_t)init_array + 8 * (uint32_t)k);
+        if (fn && fn != ~0ull) call((gaddr)fn, {});
     }
     return true;
 }

@@ -40,6 +40,7 @@ public:
 
     struct Impl;
 private:
+    bool load64(const std::string& path);
     uint8_t* mem_ = nullptr;
     Impl* impl_ = nullptr;
     std::string err_;

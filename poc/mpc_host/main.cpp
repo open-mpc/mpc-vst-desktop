@@ -47,13 +47,24 @@ uint32_t guest_master(Guest&, uint32_t, int32_t op, int32_t, int32_t, uint32_t, 
 
 struct Emulated : Plugin {
     Guest g;
+    const bool a64;
+    // AEffect layout: armhf (4-byte pointers, as in vst2_wrap.c) or aarch64 (8-byte pointers)
+    int o_disp() const { return a64 ? 8 : 4; }
+    int o_setp() const { return a64 ? 24 : 12; }
+    int o_getp() const { return a64 ? 32 : 16; }
+    int o_nparams() const { return a64 ? 44 : 24; }
+    int o_nout() const { return a64 ? 52 : 32; }
+    int o_proc() const { return a64 ? 120 : 80; }
+    uint32_t ps() const { return a64 ? 8 : 4; }
+    void wrp(gaddr a, uint32_t v) { g.wr32(a, v); if (a64) g.wr32(a + 4, 0); }
+    explicit Emulated(bool a64_) : g(a64_), a64(a64_) {}
     gaddr eff = 0, disp = 0, proc = 0, buf_l = 0, buf_r = 0, outs = 0, ins = 0, evs = 0, ev = 0;
     int nev = 0;
     bool open(const char* path) {
         // libc functions that call back into guest code (qsort, bsearch) are guest code too: guest_helpers.so, built next to this program
         {
             char exe[4096]; const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-            if (n > 0) { exe[n] = 0; const std::string h = std::string(exe).substr(0, std::string(exe).rfind('/')) + "/guest_helpers.so"; if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
+            if (n > 0) { exe[n] = 0; const std::string h = std::string(exe).substr(0, std::string(exe).rfind('/')) + (a64 ? "/guest_helpers64.so" : "/guest_helpers.so"); if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
         }
         // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
         if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
@@ -73,23 +84,23 @@ struct Emulated : Plugin {
         t->sampleRate = kRate; t->tempo = 120; t->num = 4; t->den = 4; t->flags = (1 << 10) | (1 << 9);
         eff = g.call(main, {g.host_callback(guest_master)});
         if (!eff || g.rd32(eff) != 0x56737450) { std::fprintf(stderr, "VSTPluginMain returned no AEffect\n"); return false; }
-        disp = g.rd32(eff + 4);
-        proc = g.rd32(eff + 80);       // processReplacing (32-bit layout: see vst2_wrap.c struct AEffect)
+        disp = g.rd32(eff + o_disp());
+        proc = g.rd32(eff + o_proc());       // processReplacing (see vst2_wrap.c struct AEffect)
         buf_l = g.alloc(kBlock * 4); buf_r = g.alloc(kBlock * 4);
-        outs = g.alloc(8); g.wr32(outs, buf_l); g.wr32(outs + 4, buf_r);
-        ins = g.alloc(8); const gaddr z = g.alloc(kBlock * 4); std::memset(g.host(z), 0, kBlock * 4); g.wr32(ins, z); g.wr32(ins + 4, z);
-        evs = g.alloc(8 + 4 * 64); ev = g.alloc(32 * 64);
+        outs = g.alloc(16); wrp(outs, buf_l); wrp(outs + ps(), buf_r);
+        ins = g.alloc(16); const gaddr z = g.alloc(kBlock * 4); std::memset(g.host(z), 0, kBlock * 4); wrp(ins, z); wrp(ins + ps(), z);
+        evs = g.alloc(16 + 8 * 64); ev = g.alloc(32 * 64);
         return true;
     }
     uint32_t dispatch(int32_t op, int32_t idx, int32_t val, uint32_t ptr, float opt) { return g.call(disp, {eff, (uint32_t)op, (uint32_t)idx, (uint32_t)val, ptr}, {opt}); }
     std::string name() override { const gaddr b = g.alloc(256); g.host(b)[0] = 0; dispatch(effGetEffectName, 0, 0, b, 0); std::string s = (char*)g.host(b); g.dealloc(b); return s; }
-    int num_params() override { return (int32_t)g.rd32(eff + 24); }
-    int num_outputs() override { return (int32_t)g.rd32(eff + 32); }
+    int num_params() override { return (int32_t)g.rd32(eff + o_nparams()); }
+    int num_outputs() override { return (int32_t)g.rd32(eff + o_nout()); }
     void start() override { dispatch(effOpen, 0, 0, 0, 0); dispatch(effSetSampleRate, 0, 0, 0, (float)kRate); dispatch(effSetBlockSize, 0, kBlock, 0, 0); dispatch(effMainsChanged, 0, 1, 0, 0); }
-    void set_param(int i, float v) override { g.call(g.rd32(eff + 12), {eff, (uint32_t)i}, {v}); }   // setParameter at byte 12
-    float get_param(int i) override { return g.call_f(g.rd32(eff + 16), {eff, (uint32_t)i}); }        // getParameter at byte 16
+    void set_param(int i, float v) override { g.call(g.rd32(eff + o_setp()), {eff, (uint32_t)i}, {v}); }
+    float get_param(int i) override { return g.call_f(g.rd32(eff + o_getp()), {eff, (uint32_t)i}); }
     std::vector<uint8_t> get_chunk() override {
-        const gaddr pp = g.alloc(4); g.wr32(pp, 0);
+        const gaddr pp = g.alloc(8); g.wr32(pp, 0); g.wr32(pp + 4, 0);
         const int32_t n = (int32_t)dispatch(effGetChunk, 0, 0, pp, 0);
         const gaddr data = g.rd32(pp);
         std::vector<uint8_t> c;
@@ -109,11 +120,11 @@ struct Emulated : Plugin {
         std::memset(g.host(e), 0, 32);
         g.wr32(e, 1); g.wr32(e + 4, 32);
         std::memcpy(g.host(e + 24), m, 3);
-        g.wr32(evs + 8 + 4 * nev, e);
+        wrp(evs + (a64 ? 16 : 8) + ps() * nev, e);
         nev++;
     }
     void process(float* l, float* r) override {
-        if (nev) { g.wr32(evs, nev); g.wr32(evs + 4, 0); dispatch(effProcessEvents, 0, 0, evs, 0); nev = 0; }
+        if (nev) { g.wr32(evs, nev); g.wr32(evs + 4, 0); if (a64) { g.wr32(evs + 8, 0); g.wr32(evs + 12, 0); } dispatch(effProcessEvents, 0, 0, evs, 0); nev = 0; }
         g.call(proc, {eff, ins, outs, (uint32_t)kBlock});
         std::memcpy(l, g.host(buf_l), kBlock * 4);
         std::memcpy(r, g.host(buf_r), kBlock * 4);
@@ -262,7 +273,10 @@ int main(int argc, char** argv) {
     const std::string prefix = argc > 4 ? argv[4] : "mpc_host";
     const int blocks = (int)(secs * kRate / kBlock);
 
-    auto emu = std::make_unique<Emulated>();
+    // an ELF64 plugin is aarch64 (Gen2), an ELF32 one armhf (Gen1)
+    bool a64 = false;
+    if (FILE* f = std::fopen(argv[1], "rb")) { unsigned char id[5] = {}; if (std::fread(id, 1, 5, f) == 5) a64 = id[4] == 2; std::fclose(f); }
+    auto emu = std::make_unique<Emulated>(a64);
     if (!emu->open(argv[1])) return 1;
     std::printf("emulated: \"%s\", %d params, %d outputs\n", emu->name().c_str(), emu->num_params(), emu->num_outputs());
     const Run a = render(*emu, blocks);
