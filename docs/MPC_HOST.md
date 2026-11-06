@@ -256,16 +256,20 @@ Checked 2026-11-06 on the 57 aarch64 `VSTPluginMain` builds found in the author'
   profit5, trcw78, kr106, monomodule fx and one, the 8 airwin2rack plugins, and others. Audio rms is non-zero for the synths (model303 0.013, Dexed 0.042, maze voice 0.101, JV-880 0.041).
   Speed on the 4-core VM, 128-frame blocks (2.9 ms): model303 16% of the budget, maze voice 5%, boris 2%, Dexed under 1%.
 - **Settable parameters, no chunk:** OTT, Reverbicon 224 (cineol224).
-- **Partial or no restore, not a host symptom as far as known:** machinedrum_one/b (the 512-byte chunk again, so a stale wrapper copy in those builds; the current wrapper's buffer is 8192),
-  je8086, vavra, nodalred2x, xenia, osirus, ms2kr: each restores some parameters from a short chunk (53-258 B). Not yet compared with a native build to tell whether the port
-  keeps only a subset or the host loses something.
+- **Partial restores, looked at with `MPC_HOST_DUMP=1` (the chunk text before and after the restore); none points at the host:**
+  - je8086, vavra, nodalred2x, xenia, ms2kr: the chunk is a small JSON or text record (bank, preset, gain and a few fields, 53-258 B), not every knob, so parameters outside
+    it keep the value the test set. xenia's and ms2kr's chunks come back identical after the restore. vavra and nodalred2x read the bank list from files: with no bank files under
+    `MPC_HOST_ROOT` the bank clamps to what exists (bank 15 comes back as 2 and 0, and a set of 0.25 reads back 0.238).
+  - osirus: the restore is ignored (the chunk after still holds the test's values, `rom_model` is `"?"`): it very likely needs its ROM, which is not under the root.
+  - machinedrum_one/b: the chunk is exactly 512 bytes for 672 slots, so it is cut off, most likely by a 512-byte chunk buffer in the wrapper copy those builds were made with
+    (mpc-vst-plugins now has 8192). Not confirmed against that checkout.
 - **Stops on one import:** welle (`readlink`), the plugin manager (`statvfs`). **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
 
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: the partial restores on aarch64 (compare with native builds), `dl_iterate_phdr` for older libgcc, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` for older libgcc, a real-time scheduling plan for the emulation threads (JV-880 uses 68% of a block), the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
