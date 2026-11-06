@@ -185,6 +185,11 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         std::abort();
     }
     uint64_t GetCNTPCT() override { return 0; }
+    // a guest that generates code (asmjit in the Osirus DSP emulator) flushes the instruction cache with `ic ivau` / `ic ialluis`: drop the translated blocks
+    void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, uint64_t value) override {
+        if (op == Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU) jit64->InvalidateCacheRange(value & ~63ull, 64);
+        else jit64->ClearCache();
+    }
     void InterpreterFallback(uint32_t pc, size_t) override { std::fprintf(stderr, "guest: interpreter fallback at %08x\n", pc); std::abort(); }
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception e) override {
         using E = Dynarmic::A32::Exception;
@@ -310,6 +315,9 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     void block(St st, gaddr obj) {
         GThread& t = me();
         t.st = st; t.obj = obj; t.sleep_call = call_no;
+        static const bool trace = std::getenv("MPC_HOST_TRACE") != nullptr;
+        if (trace) std::fprintf(stderr, "[sched] t%u blocks: %s obj=%x%s\n", t.id, st == WaitMutex ? "mutex" : st == WaitCond ? "cond" : st == WaitJoin ? "join" : "sleep", obj,
+                                st == WaitMutex ? (" owner=t" + std::to_string(rd<uint32_t>(obj + 8))).c_str() : "");
         if (!schedule()) { save(t); halt(); }   // a worker with nothing to do: back to the host
     }
     void yield() {
@@ -364,7 +372,17 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     // Thunks use the armhf names: r(0..3) are the first arguments, r(13) the stack pointer, r(14) the link register; on aarch64 they read x0-x7, sp, x30.
     // An aarch64 guest keeps all addresses below 2 GB, so a 32-bit value is a whole pointer, and a sign-extended int return is also a correct long/pointer.
     void halt() { if (a64) jit64->HaltExecution(); else jit->HaltExecution(); }
-    void run() { if (a64) { jit64->Run(); jit64->ClearHalt(Dynarmic::HaltReason::UserDefined1); } else { jit->Run(); jit->ClearHalt(Dynarmic::HaltReason::UserDefined1); } }
+    // Run until the guest asks to stop (a thunk halts, or the return stub). A cache invalidation (guest-generated code flushed with `ic ivau`) also
+    // makes dynarmic's Run() return: that is not a stop, so go on from where the guest was.
+    void run() {
+        using HR = Dynarmic::HaltReason;
+        for (;;) {
+            const HR hr = a64 ? jit64->Run() : jit->Run();
+            if ((static_cast<uint32_t>(hr) & static_cast<uint32_t>(HR::UserDefined1)) == 0 && (static_cast<uint32_t>(hr) & static_cast<uint32_t>(HR::CacheInvalidation)) != 0) continue;
+            break;
+        }
+        if (a64) jit64->ClearHalt(HR::UserDefined1); else jit->ClearHalt(HR::UserDefined1);
+    }
     uint32_t r(int i) {
         if (!a64) return jit->Regs()[i];
         return (uint32_t)(i == 13 ? jit64->GetSP() : jit64->GetRegister(i == 14 ? 30 : i));

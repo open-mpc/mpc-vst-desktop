@@ -256,15 +256,19 @@ Checked 2026-11-06 on the 57 aarch64 `VSTPluginMain` builds found in the author'
   profit5, trcw78, kr106, monomodule fx and one, the 8 airwin2rack plugins, and others. Audio rms is non-zero for the synths (model303 0.013, Dexed 0.042, maze voice 0.101, JV-880 0.041).
   Speed on the 4-core VM, 128-frame blocks (2.9 ms): model303 16% of the budget, maze voice 5%, boris 2%, Dexed under 1%.
 - **Settable parameters, no chunk:** OTT, Reverbicon 224 (cineol224).
-- **Partial restores, looked at with `MPC_HOST_DUMP=1` (the chunk text before and after the restore); none points at the host:**
+- **Partial restores, looked at with `MPC_HOST_DUMP=1` (the chunk text before and after the restore); none points at the host (osirus was listed here before its ROMs were linked; see below):**
   - je8086, vavra, nodalred2x, xenia, ms2kr: the chunk is a small JSON or text record (bank, preset, gain and a few fields, 53-258 B), not every knob, so parameters outside
     it keep the value the test set. xenia's and ms2kr's chunks come back identical after the restore. vavra and nodalred2x read the bank list from files: with no bank files under
     `MPC_HOST_ROOT` the bank clamps to what exists (bank 15 comes back as 2 and 0, and a set of 0.25 reads back 0.238).
-  - osirus: the restore is ignored (the chunk after still holds the test's values, `rom_model` is `"?"`): it very likely needs its ROM, which is not under the root.
+  - osirus: without ROMs the restore was ignored (`rom_model` was `"?"`); with them see below.
   - machinedrum_one/b: the chunk is exactly 512 bytes for 672 slots, so it is cut off, most likely by a 512-byte chunk buffer in the wrapper copy those builds were made with
     (mpc-vst-plugins now has 8192). Not confirmed against that checkout.
 - **Welle** (aarch64, after `readlink` and the wide-character class stubs): renders (rms 0.26, peak 0.42, 18% of the budget) and restores 8/8 parameters from a 512 B chunk. **Plugin manager** (`openmpc_pm_g2`): loads, no settable parameter.
-- **Not testable here:** osirus needs a Virus ROM (none under `~/roms`). **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
+- **Osirus** (aarch64, Virus B and C ROMs from `~/roms/virus` linked as `$ROOT/sdcard/vst/osirus/roms/*.bin`; the README says `<plugin folder>/osirus/roms`, this build looks under `/sdcard/vst`):
+  loads the ROMs, boots its DSP56300 emulator on guest threads, renders (rms 0.155, peak 0.5) and answers with a 4816 B chunk. The emulator generates code at run time (asmjit), which needed
+  two host fixes: `ic ivau`/`ic ialluis` now invalidate dynarmic's translated blocks (`InstructionCacheOperationRaised`), and `run()` goes on when `Run()` returns for `CacheInvalidation`
+  instead of treating it as a stop (before that the thread restarted from its entry point). Speed: median 3.5 ms per 128-frame block (120% of the 2.9 ms budget), so not real time
+  on this VM. Restoring a chunk changes 0/8 of the test's parameters; not looked at further. **cratedigger** returns no `AEffect` (it needs its engine bundle, see above).
 
 ## Next steps
 
