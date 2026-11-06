@@ -337,6 +337,8 @@ libgcc_s for armv7 and aarch64, from the Ubuntu cross packages, with their copyr
 the author's Windows 11 machine and running `test.bat` (all 8 passed), `check.bat` and `render.bat` on a real plugin (Maze Voice: ok at 6%, a 3 s stereo 44.1 kHz WAV with peak 0.222). The first package had a carriage return in its
 name (the version came from the Windows program's output); fixed before release. The executable is unsigned.
 
+The VST3 built on this library (editor, Q-Links, the Plugin Manager as the default content) is designed in `docs/MPC_VST3_HOST.md`.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
