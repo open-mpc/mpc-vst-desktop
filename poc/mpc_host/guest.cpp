@@ -72,6 +72,30 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<uint32_t> keys;   // pthread_key values
     struct Mod { gaddr base, end, exidx; uint32_t exidx_size; gaddr eh = 0; };   // eh: .eh_frame_hdr (PT_GNU_EH_FRAME) for _dl_find_object   // for __gnu_Unwind_Find_exidx (ARM EHABI unwinding)
     std::vector<Mod> mods;
+    // dl_iterate_phdr (older libgcc finds exception tables with it): the callback is guest code, so the loop is guest code too (assembled with the cross assemblers
+    // from a loop that calls cb(info, sizeof info, data) for each module until it returns non-zero); the host keeps the dl_phdr_info records it walks.
+    gaddr dlphdr_region = 0, dlphdr_stub = 0;   // region: u32 count at +0, records from +8 (64 bytes each on aarch64, 40 on armhf)
+    void register_phdr(gaddr bias, const std::string& path, const void* phdrs, int phnum, size_t entsz) {
+        const uint32_t rec = a64 ? 64 : 40;
+        if (!dlphdr_region) { dlphdr_region = data(8 + 32 * 64, 8); wr<uint32_t>(dlphdr_region, 0); }
+        const uint32_t n = rd<uint32_t>(dlphdr_region);
+        if (n >= 32) return;
+        const gaddr copy = data((uint32_t)(entsz * phnum), 8); std::memcpy(m + copy, phdrs, entsz * phnum);   // the table is copied: the file's headers need not be mapped
+        const gaddr r = dlphdr_region + 8 + n * rec; std::memset(m + r, 0, rec);
+        wrp(r, bias); wrp(r + (a64 ? 8 : 4), cstr(path.c_str())); wrp(r + (a64 ? 16 : 8), copy); wr<uint16_t>(r + (a64 ? 24 : 12), (uint16_t)phnum);
+        wr<uint32_t>(dlphdr_region, n + 1);
+    }
+    gaddr dl_iterate_phdr_stub() {
+        if (dlphdr_stub) return dlphdr_stub;
+        if (!dlphdr_region) { dlphdr_region = data(8 + 32 * 64, 8); wr<uint32_t>(dlphdr_region, 0); }
+        static const std::vector<uint32_t> A64 = {0xA9BD7BFD, 0x910003FD, 0xA90153F3, 0xA9025BF5, 0xAA0003F3, 0xAA0103F4, 0x10000249, 0xF9400135, 0xB94002B6, 0x910022B5, 0x52800000, 0x34000136,
+                                                  0xAA1503E0, 0xD2800801, 0xAA1403E2, 0xD63F0260, 0x35000080, 0x910102B5, 0x510006D6, 0x17FFFFF8, 0xA9425BF5, 0xA94153F3, 0xA8C37BFD, 0xD65F03C0, 0, 0};
+        static const std::vector<uint32_t> A32 = {0xE92D40F0, 0xE1A04000, 0xE1A05001, 0xE59F6038, 0xE5967000, 0xE2866008, 0xE3A00000, 0xE3570000, 0x0A000008, 0xE1A00006, 0xE3A01028,
+                                                  0xE1A02005, 0xE12FFF34, 0xE3500000, 0x1A000002, 0xE2866028, 0xE2477001, 0xEAFFFFF4, 0xE8BD80F0, 0};
+        std::vector<uint32_t> code = a64 ? A64 : A32;
+        code[a64 ? 24 : 19] = dlphdr_region;   // the literal after the code: where the records are (aarch64: the low half of a .quad)
+        return dlphdr_stub = stub(code);
+    }
     std::vector<std::string> stubs_called;   // unsupported imports the guest actually called (MPC_HOST_LAX only; otherwise the first one aborts)
     gaddr errno_p = 0, clocale = 0;
     // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
@@ -1020,6 +1044,8 @@ std::vector<Entry> libc_table() {
     for (const char* n : {"posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy", "posix_spawn_file_actions_addopen", "iconv_close"}) add(n, [](I& i) { i.ret(0); });
     // glibc 2.35+: struct dl_find_object { u64 flags; void *map_start, *map_end, *link_map, *eh_frame; ... } (aarch64 layout); libgcc's unwinder uses it
     add("_dl_find_object", [](I& i) {
+        static const bool off = std::getenv("MPC_HOST_NO_DLFO") != nullptr;   // test switch: make the unwinder fall back to dl_iterate_phdr
+        if (off) { i.ret(0xFFFFFFFFu); return; }
         for (auto& md : i.mods) if (i.r(0) >= md.base && i.r(0) < md.end && md.eh) {
             const gaddr r = i.r(1); std::memset(i.m + r, 0, 64);
             i.wr<uint64_t>(r + 8, md.base); i.wr<uint64_t>(r + 16, md.end); i.wr<uint64_t>(r + 32, md.eh);
@@ -1111,6 +1137,7 @@ gaddr resolve_import(I& i, std::vector<std::string>& missing, std::unordered_map
         i.wrp(pp, tbl + 128 * esz);
         return i.thunk_for(name, [pp](I& ii) { ii.ret(pp); });
     }
+    if (name == "dl_iterate_phdr") return i.dl_iterate_phdr_stub();
     if (name == "pthread_once") {   // guest code, so the init routine runs without a nested call: if (!*once) { *once = 1; tail-call init }
         if (auto t = i.thunk_by_name.find(name); t != i.thunk_by_name.end()) return t->second;
         return i.thunk_by_name[name] = i.a64
@@ -1299,6 +1326,7 @@ bool Guest::load(const std::string& path) {
     i.load_next = (bias + end + 0xFFFFu) & ~0xFFFFu;
     i.mods.push_back({bias, bias + end, exidx.first, exidx.second});
     i.mod_paths.push_back(path);
+    i.register_phdr(bias, path, file.data() + eh->e_phoff, eh->e_phnum, eh->e_phentsize);
     if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + end);
     i.plugin_dir = std::filesystem::path(path).parent_path().string();
     // dynamic section (read after the copy: it lives in a loaded segment)
@@ -1411,6 +1439,7 @@ bool Guest::load64(const std::string& path) {
     i.load_next = (bias + (uint32_t)end + 0xFFFFu) & ~0xFFFFu;
     i.mods.push_back({bias, bias + (uint32_t)end, 0, 0, eh_frame ? bias + (uint32_t)eh_frame : 0});
     i.mod_paths.push_back(path);
+    i.register_phdr(bias, path, file.data() + eh->e_phoff, eh->e_phnum, eh->e_phentsize);
     if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + (uint32_t)end);
     i.plugin_dir = std::filesystem::path(path).parent_path().string();
     uint64_t symtab = 0, strtab = 0, rela = 0, relasz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;

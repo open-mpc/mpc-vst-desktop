@@ -5,6 +5,9 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <glob.h>
+#include <link.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,9 +17,28 @@
 
 typedef struct { int ok; double level, tone; } f_t;
 
+/* dl_iterate_phdr: the walk is guest code calling this guest callback; it finds the module that holds self_test() through its program headers */
+struct walk { int modules, found; };
+static int self_test(void);
+static int walk_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    struct walk *w = data;
+    w->modules++;
+    if (size < offsetof(struct dl_phdr_info, dlpi_phnum) + sizeof info->dlpi_phnum || !info->dlpi_phdr) return 0;
+    for (int k = 0; k < info->dlpi_phnum; k++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[k];
+        if (ph->p_type == PT_LOAD) {
+            const uintptr_t lo = info->dlpi_addr + ph->p_vaddr, hi = lo + ph->p_memsz, me = (uintptr_t)self_test;
+            if (me >= lo && me < hi) { w->found = 1; return 42; }   /* a non-zero return ends the walk and is returned by dl_iterate_phdr */
+        }
+    }
+    return 0;
+}
+
 static int cmp_int(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
 
 static int self_test(void) {
+    struct walk wk = {0, 0};
+    if (dl_iterate_phdr(walk_cb, &wk) != 42 || !wk.found || wk.modules < 1) return 0;
     int v[] = {5, 2, 9, 1, 7, 3}, key = 7;   /* qsort and bsearch call back into guest code: they run from guest_helpers.so */
     qsort(v, 6, sizeof v[0], cmp_int);
     if (v[0] != 1 || v[5] != 9 || !bsearch(&key, v, 6, sizeof v[0], cmp_int)) return 0;

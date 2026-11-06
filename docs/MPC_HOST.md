@@ -244,7 +244,7 @@ resumes at the `bx lr` after its own `svc`; no nested `Run()` is needed. Rules:
 - **Layouts.** `long`/`time_t` 64-bit (`time`, `gettimeofday`, `clock_gettime`), aarch64 `struct stat` (128 bytes), only the 64-bit `dirent`, pointer-sized `glob_t`, `Dl_info`,
   `pthread_t`, `pthread_mutex_t` (48 bytes, kind at +16), `tls_index`.
 - **Unwinding.** The aarch64 unwinder asks `_dl_find_object(pc, &result)` for the module's `.eh_frame_hdr`; the host answers from `PT_GNU_EH_FRAME`.
-  Not done: `dl_iterate_phdr` (older libgcc), which needs a guest-code callback loop.
+  Older libgcc finds the tables with `dl_iterate_phdr` instead (see below).
 - **Instructions dynarmic's A64 front end lacks.** Newer compilers emit LSE atomics (`SWP`, `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`LDSMAX`/`LDSMIN`/`LDUMAX`/`LDUMIN`, `CAS`)
   and `LDAPR`. They arrive in `InterpreterFallback` and are emulated there as plain loads and stores (one guest CPU, one thread at a time), then execution continues. Other missing
   instructions still stop with the instruction word printed.
@@ -296,6 +296,15 @@ cratedigger blocked (cannot start), rhythmbank (armv7) blocked (`crashed (signal
 `MPC_HOST_ENFORCE=1` makes a normal run do the check first and refuse a blocked plugin (exit 4); `MPC_HOST_FORCE=1` overrides it. A plugin scanner (the future VST3 shell)
 should run `--check` once per plugin file and host build, keep the verdict (key: file size and mtime, host version), load only what is not blocked, and show the reasons for the
 rest. The thresholds depend on the machine, so a verdict is a statement about this machine; the numbers are in the JSON. `smoke.sh` runs `--check` on every fixture and requires "ok".
+
+## dl_iterate_phdr (2026-11-06, offline)
+
+`dl_iterate_phdr(cb, data)` calls a guest function for each loaded module, which a host thunk cannot do, so it is guest code: a loop of about 20 instructions per architecture (assembled
+with `aarch64-linux-gnu-as` and `arm-linux-gnueabihf-as`; the words are in `guest.cpp`) that walks `dl_phdr_info` records the host writes at each load (address bias, name, a copy of the
+program headers, their count; 64 bytes on aarch64, 40 on armhf) and calls `cb(info, sizeof info, data)` until it returns non-zero, returning that value. Checked with
+`poc/mpc_host/filetest` on both architectures: a guest callback finds the module that holds the fixture's own code through its `PT_LOAD` headers, and its return value (42) stops the walk and comes back.
+Not checked: an unwinder that uses it. The libgcc_s here (GCC 15) asks `_dl_find_object` first and gives up when that fails, so `MPC_HOST_NO_DLFO=1`, which makes `_dl_find_object` fail, ends in
+`abort` rather than in the fallback; a plugin with a statically linked older libgcc is the real test, and none of the local builds is one.
 
 ## Next steps
 
