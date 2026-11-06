@@ -174,6 +174,52 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         }
         return out;
     }
+
+    // sscanf: %d %i %u %x %o %f %g %e %s %c %n %% and literals, the l modifier, and * to skip. Field widths are ignored.
+    // Returns the number of stores, or -1 (EOF) if the input ends before the first conversion.
+    int scan(const char* in, const char* f, VarArgs va) {
+        int n = 0; const char* s = in;
+        while (*f) {
+            if (std::isspace((unsigned char)*f)) { while (std::isspace((unsigned char)*s)) s++; f++; continue; }
+            if (*f != '%') { if (*s != *f) return (!*s && !n) ? -1 : n; s++; f++; continue; }
+            f++;
+            if (*f == '%') { if (*s != '%') return n; s++; f++; continue; }
+            bool skip = false; if (*f == '*') { skip = true; f++; }
+            while (std::isdigit((unsigned char)*f)) f++;
+            int lng = 0;
+            while (*f && std::strchr("hlLzjt", *f)) { if (*f == 'l') lng++; f++; }
+            const char c = *f++;
+            if (c == 'n') { if (!skip) wr<uint32_t>(va.next32(), (uint32_t)(s - in)); continue; }
+            if (c != 'c') while (std::isspace((unsigned char)*s)) s++;
+            if (!*s) return n ? n : -1;
+            char* e = const_cast<char*>(s);
+            switch (c) {
+            case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
+                const int base = c == 'x' || c == 'X' ? 16 : c == 'o' ? 8 : c == 'i' ? 0 : 10;
+                const long v = (c == 'u' || base == 16 || base == 8) ? (long)std::strtoul(s, &e, base) : std::strtol(s, &e, base);
+                if (e == s) return n;
+                if (!skip) wr<uint32_t>(va.next32(), (uint32_t)v);
+                break; }
+            case 'f': case 'g': case 'e': case 'a': case 'E': case 'G': {
+                const double v = std::strtod(s, &e);
+                if (e == s) return n;
+                if (!skip) { const gaddr p = va.next32(); if (lng) std::memcpy(m + p, &v, 8); else { const float fv = (float)v; std::memcpy(m + p, &fv, 4); } }
+                break; }
+            case 's': {
+                while (*e && !std::isspace((unsigned char)*e)) e++;
+                if (!skip) { const gaddr p = va.next32(); std::memcpy(m + p, s, (size_t)(e - s)); m[p + (e - s)] = 0; }
+                break; }
+            case 'c':
+                e = const_cast<char*>(s) + 1;
+                if (!skip) m[va.next32()] = (uint8_t)*s;
+                break;
+            default: return n;
+            }
+            s = e;
+            if (!skip) n++;
+        }
+        return n;
+    }
     void put(gaddr buf, uint32_t n, const std::string& s) {
         if (n) { const size_t k = std::min<size_t>(s.size(), n - 1); std::memcpy(m + buf, s.data(), k); m[buf + k] = 0; }
         ret((uint32_t)s.size());
@@ -227,6 +273,11 @@ std::vector<Entry> libc_table() {
     add("atof", [](I& i) { i.ret_d(std::atof(i.str(i.r(0)))); });
     add("atoi", [](I& i) { i.ret((uint32_t)std::atoi(i.str(i.r(0)))); });
     add("getenv", [](I& i) { i.ret(0); });   // no environment for guests
+    // scanf family (strings only; no stdin or files)
+    auto sscanf_ = [](I& i) { i.ret((uint32_t)i.scan(i.str(i.r(0)), i.str(i.r(1)), {i, 2, i.r(13)})); };
+    add("sscanf", sscanf_);
+    add("__isoc99_sscanf", sscanf_);
+    add("__isoc23_sscanf", sscanf_);
     // printf family
     add("snprintf", [](I& i) { const gaddr b = i.r(0); const uint32_t n = i.r(1); i.put(b, n, i.format(i.str(i.r(2)), {i, 3, i.r(13)})); });
     add("__snprintf_chk", [](I& i) { const gaddr b = i.r(0); const uint32_t n = i.r(1); i.put(b, n, i.format(i.str(i.arg(4)), {i, 4, i.r(13) + 4})); });
