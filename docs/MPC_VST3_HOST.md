@@ -85,9 +85,11 @@ Still to decide (see below): which hosts the curl shim may reach, and whether sw
 
 **Done and committed:** `poc/mpc_host/hosted.{h,cpp}` (`HostedPlugin`, per-instance: `open`, `start`, `num_params`, `param_name/label/display`, `set_param/get_param`, `midi(status,d1,d2,delta)`, `set_transport`, `process(l,r)` in 128-frame blocks, `get_chunk/set_chunk`, `take_automation`, `take_display_dirty`; not thread-safe, so the VST3 holds one mutex). The CLI (`main.cpp`) uses it. Windows build of the CLI works (`build_windows.sh`, `package_windows.sh`, `smoke_windows.sh`; tested under Wine and natively). Design = this file.
 
-**Not started:** any `vst3host/` code.
+**M1 done (2026-11-07, offline):** `vst3host/vst3_host.cpp` is the module (IComponent + IAudioProcessor + IEditController + IMidiMapping in one object; parameters: Q-Link 1..8, Bank, Next Bank, Mode, Bypass, then the hosted plugin's, plus hidden CC / pressure / pitch-bend parameters for the host's MIDI mapping). `vst3host/build_linux.sh` and `build_windows.sh` make `OpenMPC Host.vst3`. It hosts `Resources/plugins/<name>/<name>.so` (`Resources/default.txt` names the folder, default `openmpc_pm_g2`; `OPENMPC_HOST_PLUGIN=<path to .so>` overrides). The plugin's "/" is `%APPDATA%/OpenMPC Host/root` (`~/.local/share/openmpc-host/root`; `OPENMPC_HOST_ROOT`). `tools/vst3_host_test.c` passes on Linux and natively on Windows 11: the manager loads (309 parameters, no sound by nature), Dexed (aarch64) sounds at 44.1/48/96 kHz with the same level on both, state round-trips. Not yet tried in a DAW. Q-Links use the fallback map (knob n of bank b = parameter b*mode+n); no editor yet; switching plugins inside the instance (M2) not yet.
 
-**Where to begin (M1):**
+**Not started:** M2 onward.
+
+**Where M1 began (done):**
 1. Create `vst3host/` with `vst3_host.cpp` (hand-written ABI: reuse `mpc-vst-plugins/wrapper/vst3_abi.h` and `resample.h`; model the factory and object layout on `mpc-vst-plugins/wrapper/vst3_wrap.c`), linking `guest.cpp hosted.cpp` and dynarmic from `poc/mpc_host/build*/` (see `build.sh` / `build_windows.sh` for flags).
 2. `vst3host/build_windows.sh` -> `OpenMPC Host.vst3/Contents/x86_64-win/*.vst3` (+ guest runtime libs as in `package_windows.sh`).
 3. Test with a small host (extend `tools/vst3_host_test.c`), then Wine, then the user's Windows 11 PC (WSL interop works: see the earlier Windows test flow; copy to `C:\Users\Sam\Downloads`).

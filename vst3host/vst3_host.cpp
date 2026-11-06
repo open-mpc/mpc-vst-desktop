@@ -2,6 +2,7 @@
 // One object is IComponent + IAudioProcessor + IEditController. Design: docs/MPC_VST3_HOST.md. M1: instrument, runtime parameters,
 // Q-Link section (4 or 8 knobs, bank, next-bank button), audio resampled to the host rate, MIDI, state. No editor yet.
 // The ABI is hand-written (mpc-vst-plugins/wrapper/vst3_abi.h); no Steinberg SDK.
+#define _USE_MATH_DEFINES
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
