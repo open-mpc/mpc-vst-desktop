@@ -1,5 +1,7 @@
 # MPC plugin host for desktop DAWs (idea and import survey)
 
+> Moved from mpc-vst-plugins on 2026-11-06. Paths to `docs/NOTES.md`, `docs/CATALOG.md`, `docs/EMULATOR_PORTS.md`, `tools/build_port.sh`, `tools/gen_vst.py`, `tools/studio.py`, `wrapper/engine.h`, `wrapper/vst2_wrap.c`, `adapters/` and `poc/<probe>/` are in that repo: the `mpc-vst-plugins/` submodule here.
+
 **Status (2026-11-06): a Linux x86-64 prototype plays Acid-303's released-style armv7 `.so` under dynarmic (offline; see "Prototype"). No VST3 shell yet.**
 
 The goal: one VST3 for desktop DAWs on Windows and macOS (Linux too) that loads MPC plugin `.so` files *as released*
@@ -139,30 +141,15 @@ calls from the driver, aarch64 (Gen2) `.so` files, and Windows/macOS builds of t
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
-## Moving to its own repo (planned 2026-11-06)
+## Repo move (done 2026-11-06)
 
-Everything for running MPC plugins on a desktop moves to one repo (working name `mpc-vst-desktop`). It has two methods:
-the native VST3 rebuild (DESKTOP_VST3.md) and this host for released `.so` files. They share the VST3 shell, the skin
-renderer and the Windows/macOS editor work.
+This repo was split out of mpc-vst-plugins with `git filter-repo`, keeping the history of `wrapper/vst3_*`, `wrapper/resample.h`,
+`tools/build_vst3.sh`, `tools/test_vst3.sh`, `tools/vst3_host_test.c`, `tools/desktop_skin.py`, `docs/DESKTOP_VST3.md` (and its
+images), this file and `poc/mpc_host/`. mpc-vst-plugins is pinned as a submodule, and the scripts read it from there, or from
+`MPC_VST_PLUGINS`. Checked offline the same day: `tools/test_vst3.sh mpc-vst-plugins/poc/songpos/vst.json` printed "all passed",
+and `poc/mpc_host/smoke.sh` ran the songpos probe emulated. CI (`.github/workflows/ci.yml`) runs both, against the pinned commit
+and against mpc-vst-plugins main.
 
-**Moves, with history (`git filter-repo --path ...`):** `wrapper/vst3_wrap.c`, `wrapper/vst3_abi.h`,
-`wrapper/vst3_editor.c`, `wrapper/resample.h`, `tools/build_vst3.sh`, `tools/test_vst3.sh`, `tools/vst3_host_test.c`,
-`tools/desktop_skin.py`, `docs/DESKTOP_VST3.md` and `docs/images/desktop-vst3/`, `docs/MPC_HOST.md`, `poc/mpc_host/`.
-
-**Stays here:** the engine contract the rebuild compiles against (`wrapper/engine.h`, `plugin_dir.h`, `popup.h`),
-`tools/gen_vst.py` (`params.h`), the skin builder, and NOTES.md facts. The new repo pins this one as a submodule; its
-scripts already take this repo's path (`$MV` in `build_vst3.sh`).
-
-**Keeping existing workflows working:**
-1. The same command in the new repo: `tools/build_vst3.sh <port>/vst.json [--install]`.
-2. Here, `tools/build_vst3.sh` and `tools/test_vst3.sh` become stubs for a few months. They say the scripts have moved,
-   run the real one if the new repo is checked out next to this one, and otherwise print the clone command.
-3. `docs/DESKTOP_VST3.md` stays as a short pointer page, so old links work. Update the README (two places),
-   PORTING.md's desktop checklist item, the skill's step 8, CLAUDE.md, ROADMAP.md and COMPATIBILITY.md to link to the new repo.
-4. Tag this repo `pre-desktop-split` before the cleanup PR.
-5. Announce the move in the Open MPC Discord, and mention the VST3 wrapper's author in the cleanup PR.
-6. New repo CI: build and test one probe port (e.g. `poc/uiprobe`) against this repo's latest main, to catch `engine.h`
-   or `gen_vst.py` changes early.
-
-Who uses it (checked 2026-11-06): no workflow in this repo builds VST3; no other tool here calls the scripts; no code
-search hit for `vst3_wrap` outside this repo; one author in the history.
+Left to do in mpc-vst-plugins (its own PR): stub `tools/build_vst3.sh`/`test_vst3.sh` that point here; pointer pages for
+`docs/DESKTOP_VST3.md` and `docs/MPC_HOST.md`; README, PORTING.md, skill step 8, CLAUDE.md, ROADMAP.md and COMPATIBILITY.md
+links; tag `pre-desktop-split`; a Discord note.

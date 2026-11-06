@@ -1,12 +1,14 @@
 # Desktop VST3 build
 
+> Moved from mpc-vst-plugins on 2026-11-06. Paths to `docs/NOTES.md`, `docs/CATALOG.md`, `docs/EMULATOR_PORTS.md`, `tools/build_port.sh`, `tools/gen_vst.py`, `tools/studio.py`, `wrapper/engine.h`, `wrapper/vst2_wrap.c`, `adapters/` and `poc/<probe>/` are in that repo: the `mpc-vst-plugins/` submodule here.
+
 Any port built from a `vst.json` with the generic wrapper can also be built as a VST3 plugin for a desktop DAW on Linux,
 from the same engine and parameters. This is for local use beside the device build: MPC OS loads only VST2
 (docs/NOTES.md, "VST3: not supported by MPC OS"), so `tools/build_port.sh` stays the build that goes to a device, and
 nothing here changes it.
 
 ```sh
-tools/build_vst3.sh <port>/vst.json             # <port>/build/vst3/<name>.vst3
+tools/build_vst3.sh <port>/vst.json             # <port>/build/vst3/<name>.vst3 (mpc-vst-plugins from the submodule or MPC_VST_PLUGINS)
 tools/build_vst3.sh <port>/vst.json --install   # and copy it to ~/.vst3
 tools/test_vst3.sh <port>/vst.json              # offline test under ASan/UBSan (below)
 ```
