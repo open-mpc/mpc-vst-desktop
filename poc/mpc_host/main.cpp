@@ -8,11 +8,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
+#endif
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +27,20 @@ namespace {
 constexpr int kBlock = 128;
 constexpr double kRate = 44100.0;
 enum { effOpen = 0, effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12, effGetChunk = 23, effSetChunk = 24, effProcessEvents = 25, effGetEffectName = 45 };
+
+#ifdef _WIN32
+constexpr char kPathSep = ';';   // MPC_HOST_LIBS is a list of paths: ';' on Windows (a ':' is part of a drive letter), ':' elsewhere
+#else
+constexpr char kPathSep = ':';
+#endif
+// the directory the guest helper libraries sit in: next to this program
+std::string exe_path() {
+#ifdef _WIN32
+    char b[4096]; const DWORD n = GetModuleFileNameA(nullptr, b, sizeof b); return std::string(b, n);
+#else
+    char b[4096]; const ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1); return n > 0 ? std::string(b, (size_t)n) : std::string();
+#endif
+}
 
 struct Plugin {
     virtual ~Plugin() = default;
@@ -66,14 +84,14 @@ struct Emulated : Plugin {
     bool open(const char* path) {
         // libc functions that call back into guest code (qsort, bsearch) are guest code too: guest_helpers.so, built next to this program
         {
-            char exe[4096]; const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-            if (n > 0) { exe[n] = 0; const std::string h = std::string(exe).substr(0, std::string(exe).rfind('/')) + (a64 ? "/guest_helpers64.so" : "/guest_helpers.so"); if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
+            const std::string exe = exe_path();
+            if (!exe.empty()) { const std::string h = exe.substr(0, exe.find_last_of("/\\")) + (a64 ? "/guest_helpers64.so" : "/guest_helpers.so"); if (FILE* f = std::fopen(h.c_str(), "rb")) { std::fclose(f); if (!g.load(h)) { std::fprintf(stderr, "load %s: %s\n", h.c_str(), g.error().c_str()); return false; } } }
         }
         // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
         if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
             std::string l = libs;
             for (size_t b = 0; b < l.size();) {
-                size_t e = l.find(':', b); if (e == std::string::npos) e = l.size();
+                size_t e = l.find(kPathSep, b); if (e == std::string::npos) e = l.size();
                 if (e > b && !g.load(l.substr(b, e - b))) { std::fprintf(stderr, "load %s: %s\n", l.substr(b, e - b).c_str(), g.error().c_str()); return false; }
                 b = e + 1;
             }
@@ -135,6 +153,7 @@ struct Emulated : Plugin {
     }
 };
 
+#ifndef _WIN32
 // --- native build of the same port (host AEffect layout) ---
 struct AEffect;
 typedef intptr_t (*Master)(AEffect*, int32_t, int32_t, intptr_t, void*, float);
@@ -192,6 +211,8 @@ struct Native : Plugin {
         n_time.samplePos += kBlock;
     }
 };
+
+#endif  // _WIN32
 
 // A fixed 16th-note acid line: notes, accents, slides via overlapping notes.
 void events_for_block(int b, Plugin& p) {
@@ -284,8 +305,12 @@ std::string jesc(const std::string& s) {
 }
 std::string jlist(const std::vector<std::string>& v) { std::string o = "["; for (size_t k = 0; k < v.size(); k++) { if (k) o += ","; o += "\"" + jesc(v[k]) + "\""; } return o + "]"; }
 
-int probe(const char* path, int out_fd) {
-    ::setenv("MPC_HOST_LAX", "1", 1);   // before the first unsupported call: record them instead of stopping
+int probe(const char* path, int out_fd, const char* prefix = "") {
+#ifdef _WIN32
+    _putenv_s("MPC_HOST_LAX", "1");
+#else
+    ::setenv("MPC_HOST_LAX", "1", 1);
+#endif   // before the first unsupported call: record them instead of stopping
     bool a64 = false;
     if (FILE* f = std::fopen(path, "rb")) { unsigned char id[5] = {}; if (std::fread(id, 1, 5, f) == 5) a64 = id[4] == 2; std::fclose(f); }
     std::vector<std::string> reasons, warnings;
@@ -312,10 +337,52 @@ int probe(const char* path, int out_fd) {
     char num[200]; std::snprintf(num, sizeof num, "\"median_pct\":%.1f,\"p99_pct\":%.1f,\"rms\":%.4f", med_pct, p99_pct, rms);
     const std::string json = "{\"plugin\":\"" + jesc(path) + "\",\"name\":\"" + jesc(name) + "\",\"arch\":\"" + (a64 ? "aarch64" : "armv7") + "\",\"verdict\":\"" + verdict + "\",\"reasons\":" +
                              jlist(reasons) + ",\"warnings\":" + jlist(warnings) + "," + num + ",\"state\":\"" + jesc(state) + "\"}\n";
-    (void)!::write(out_fd, json.data(), json.size());
+    const std::string line = prefix + json;
+#ifdef _WIN32
+    (void)out_fd; std::fwrite(line.data(), 1, line.size(), stdout); std::fflush(stdout);
+#else
+    (void)!::write(out_fd, line.data(), line.size());
+#endif
     return 0;
 }
 
+#ifdef _WIN32
+// Windows: run this program again as `--probe <plugin>` with stdout and stderr on one pipe; the probe's JSON line starts with MPCHOST_JSON.
+int check_main(const char* path, int timeout_s) {
+    SECURITY_ATTRIBUTES sa = {sizeof sa, nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 4;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si = {}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    std::string cmd = "\"" + exe_path() + "\" --probe \"" + path + "\"";
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) { CloseHandle(rd); CloseHandle(wr); return 4; }
+    CloseHandle(wr);
+    std::string out; bool timed_out = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        DWORD avail = 0;
+        while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail) { char buf[4096]; DWORD n = 0; if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || !n) break; out.append(buf, n); }
+        if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {   // exited: take what is left
+            while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail) { char buf[4096]; DWORD n = 0; if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || !n) break; out.append(buf, n); }
+            break;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) { timed_out = true; TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 2000); break; }
+    }
+    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(rd);
+    std::string json; const size_t mk = out.rfind("MPCHOST_JSON ");
+    if (mk != std::string::npos) json = out.substr(mk + 13, out.find('\n', mk) - mk - 13) + "\n";
+    if (json.empty()) {
+        const std::string why = timed_out ? "hung: no result within " + std::to_string(timeout_s) + " s" : "crashed (exit code " + std::to_string(code) + ")";
+        std::string hint; const size_t pos = out.rfind("guest:");
+        if (pos != std::string::npos) hint = out.substr(pos, out.find('\n', pos) - pos);
+        json = "{\"plugin\":\"" + jesc(path) + "\",\"verdict\":\"blocked\",\"reasons\":" + jlist({why + (hint.empty() ? "" : ": " + hint)}) + ",\"warnings\":[]}\n";
+    }
+    std::fputs(json.c_str(), stdout);
+    return json.find("\"verdict\":\"blocked\"") != std::string::npos ? 4 : json.find("\"verdict\":\"degraded\"") != std::string::npos ? 3 : 0;
+}
+#else
 // Runs probe() in a child with a time limit. Exit code: 0 ok, 3 degraded, 4 blocked. Prints one JSON line.
 int check_main(const char* path, int timeout_s) {
     int jp[2], ep[2];
@@ -354,9 +421,11 @@ int check_main(const char* path, int timeout_s) {
     std::fputs(json.c_str(), stdout);
     return json.find("\"verdict\":\"blocked\"") != std::string::npos ? 4 : json.find("\"verdict\":\"degraded\"") != std::string::npos ? 3 : 0;
 }
+#endif
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: %s <plugin .so> [native .so] [seconds] [out prefix]\n       %s --check <plugin .so> [timeout seconds]   (prints a JSON verdict; exit 0 ok, 3 degraded, 4 blocked)\n", argv[0], argv[0]); return 2; }
+    if (!std::strcmp(argv[1], "--probe") && argc > 2) return probe(argv[2], 1, "MPCHOST_JSON ");
     if (!std::strcmp(argv[1], "--check")) { if (argc < 3) return 2; return check_main(argv[2], argc > 3 ? std::atoi(argv[3]) : 180); }
     // MPC_HOST_ENFORCE=1: check the plugin first and refuse a blocked one (MPC_HOST_FORCE=1 overrides). A host that scans for plugins does the same with --check.
     if (std::getenv("MPC_HOST_ENFORCE") && !std::getenv("MPC_HOST_FORCE")) {
@@ -378,6 +447,7 @@ int main(int argc, char** argv) {
     write_wav(prefix + "_emulated.wav", a);
     bool ok = state_check("emulated", *emu);
 
+#ifndef _WIN32
     if (argc > 2 && std::strcmp(argv[2], "-")) {
         auto nat = std::make_unique<Native>();
         if (!nat->open(argv[2])) return 1;
@@ -389,5 +459,6 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < a.l.size(); k++) { const double d = a.l[k] - b.l[k]; diff += d * d; ref += (double)b.l[k] * b.l[k]; maxd = std::fmax(maxd, std::fabs(d)); }
         std::printf("difference: %.1f dB below the native signal, max %.5f\n", 10 * std::log10(ref / (diff + 1e-30)), maxd);
     }
+#endif
     return ok ? 0 : 1;
 }

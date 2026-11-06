@@ -35,7 +35,7 @@ jobs:
         with:
           submodules: true
       - name: Install
-        run: sudo apt-get update -q && sudo apt-get install -y -q libboost-dev ninja-build gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        run: sudo apt-get update -q && sudo apt-get install -y -q libboost-dev ninja-build gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-aarch64-linux-gnu g++-aarch64-linux-gnu g++-mingw-w64-x86-64-posix wine64
       - uses: actions/cache@v4
         with:
           path: poc/mpc_host/build/dynarmic
@@ -55,3 +55,9 @@ jobs:
           for t in poc/mpc_host/statetest poc/mpc_host/threadtest poc/mpc_host/filetest poc/mpc_host/cxxtest; do
             ARCH=aarch64 poc/mpc_host/smoke.sh $t/vst.json
           done
+      # Not yet seen to run in CI (checked locally 2026-11-06 with mingw-w64 and Wine unpacked from the Ubuntu packages), so a failure here does not fail the build
+      - name: Windows build (mingw-w64) and the fixtures under Wine
+        continue-on-error: true
+        run: |
+          poc/mpc_host/build_windows.sh
+          poc/mpc_host/smoke_windows.sh

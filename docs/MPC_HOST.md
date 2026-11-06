@@ -306,11 +306,28 @@ program headers, their count; 64 bytes on aarch64, 40 on armhf) and calls `cb(in
 Not checked: an unwinder that uses it. The libgcc_s here (GCC 15) asks `_dl_find_object` first and gives up when that fails, so `MPC_HOST_NO_DLFO=1`, which makes `_dl_find_object` fail, ends in
 `abort` rather than in the fallback; a plugin with a statically linked older libgcc is the real test, and none of the local builds is one.
 
+## Windows (2026-11-06, cross-built with mingw-w64 and run under Wine; not run on a real Windows machine)
+
+`poc/mpc_host/build_windows.sh` cross-builds `build-win/mpc_host.exe` (static, 64-bit, dynarmic with both front ends) with the mingw-w64 POSIX-threads compilers
+(`g++-mingw-w64-x86-64-posix`; `MINGW_BIN=<dir>` if they are not on PATH). The guest side is unchanged: the same armhf and aarch64 `.so` files and guest helper libraries run on every host.
+What the host needed for Windows:
+- **Guest memory.** The 4 GB arena is reserved with `VirtualAlloc` and committed in 1 MB steps as the guest uses it (the low data area, each module's segments, heap growth, the main stack).
+- **ELF structures.** mingw has no `<elf.h>`: `elf_defs.h` has the structures and constants the loader uses (sizes and all 48 constants checked against glibc's header).
+- **Files, time, locale tables.** `hostfs.h` puts `stat`, `open` flags (the guest's Linux flags are translated), directory listing, `glob` (written in C++, with the wildcard rules of glob(3)),
+  file offsets and the clock behind one interface; the C-locale `ctype` tables are generated (checked against glibc's three tables: no mismatch) instead of copied from the host.
+- **Process handling.** `--check` starts `mpc_host.exe --probe <plugin>` with `CreateProcess` and one pipe, with the same timeout and crash reporting as the Linux fork. `MPC_HOST_LIBS` is a `;`-separated list on Windows.
+- **Left out on Windows:** the comparison with a native build (`dlopen`).
+
+Checked under Wine 10 (Ubuntu packages unpacked without root, in a user namespace so Wine finds its data files): `poc/mpc_host/smoke_windows.sh` passes all eight runs (statetest, threadtest, filetest
+and cxxtest, each as armv7 and aarch64 guests), and `--check` gives the verdicts Linux gives with nearly the same numbers (Model-303 ok at 16%, JV-880 degraded at 49%/p99 95%, Osirus blocked at 120%, cratedigger blocked).
+Not checked: a real Windows host (Wine is not Windows: memory commit, the exception handling dynarmic installs for its fast memory path, and long paths with drive letters and backslashes are
+the places a difference would show), any antivirus or code-signing behaviour, and the CI job (`continue-on-error`, never seen to run).
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). Next: `dl_iterate_phdr` for older libgcc, moving emulation threads off the audio call (JV-880 only; see "Where the time goes"), the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Threads: done (see "Threads"). `dl_iterate_phdr` and the Windows build (under Wine) are done, see their sections. Next: a run on a real Windows machine, moving emulation threads off the audio call (JV-880 only; see "Where the time goes"), and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
