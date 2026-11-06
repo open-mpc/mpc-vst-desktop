@@ -19,6 +19,7 @@
 #include <map>
 #include <sys/mman.h>
 #include <unordered_map>
+#include <cwctype>
 
 namespace mpchost {
 
@@ -26,7 +27,8 @@ namespace {
 constexpr uint64_t kSpace = 1ull << 32;
 constexpr gaddr kThunks = 0x00001000;     // svc #n; bx lr  per import (8 bytes each), up to 0x7000
 constexpr gaddr kData = 0x00008000;       // misc guest data (ctype table, stack guard, nothrow)
-constexpr gaddr kLoad = 0x00100000;       // load bias of the plugin
+constexpr gaddr kTp = 0x000C0000;         // thread pointer: TLS blocks follow it (ARM variant 1: 8-byte TCB), up to kLoad
+constexpr gaddr kLoad = 0x00100000;       // load bias of the first module; later modules follow it, 64 KB aligned
 constexpr gaddr kHeap = 0x10000000;
 constexpr gaddr kHeapEnd = 0xE0000000;
 constexpr gaddr kStackTop = 0xF0000000;   // 8 MB stack below this
@@ -45,6 +47,16 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
     std::vector<std::string> thunk_names;
     std::unordered_map<std::string, gaddr> dynsyms;
     gaddr data_next = kData;
+    gaddr load_next = kLoad;
+    std::unordered_map<std::string, gaddr> thunk_by_name, data_by_name;
+    struct TlsMod { gaddr block; uint32_t off; };   // block address, offset from the thread pointer's TLS start
+    std::vector<TlsMod> tls;                        // module id - 1
+    uint32_t tls_used = 0;
+    std::vector<uint32_t> keys;   // pthread_key values
+    gaddr errno_p = 0, clocale = 0;
+    std::unordered_map<std::string, gaddr> cstrs;
+    gaddr c_locale() { if (!clocale) clocale = data(64, 8); return clocale; }
+    gaddr cstr(const char* t) { auto& a = cstrs[t]; if (!a) { a = data((uint32_t)std::strlen(t) + 1, 1); std::strcpy((char*)m + a, t); } return a; }
     gaddr heap_next = kHeap;
     std::map<uint32_t, std::vector<gaddr>> free_lists;   // by rounded size
     std::unordered_map<gaddr, uint32_t> sizes;
@@ -103,6 +115,16 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         thunks.push_back(std::move(t));
         thunk_names.push_back(name);
         return at;
+    }
+    gaddr thunk_for(const std::string& name, const Thunk& t) {
+        auto it = thunk_by_name.find(name);
+        if (it != thunk_by_name.end()) return it->second;
+        return thunk_by_name[name] = add_thunk(name, t);
+    }
+    gaddr stub(const std::vector<uint32_t>& code) {   // ARM code in guest memory
+        const gaddr a = data((uint32_t)code.size() * 4, 4);
+        for (size_t k = 0; k < code.size(); k++) wr<uint32_t>(a + 4 * (uint32_t)k, code[k]);
+        return a;
     }
     gaddr data(uint32_t size, uint32_t align = 8) {
         data_next = (data_next + align - 1) & ~(align - 1);
@@ -235,7 +257,14 @@ namespace {
 using I = Guest::Impl;
 struct Entry { const char* name; Thunk fn; };
 
-void abort_named(I& i, const std::string& n) { std::fprintf(stderr, "guest: called %s (not supported), lr=%08x\n", n.c_str(), i.r(14)); std::abort(); }
+// MPC_HOST_LAX=1: an unsupported import logs once and returns 0 instead of stopping (to list what a plugin really calls).
+void abort_named(I& i, const std::string& n) {
+    static const bool lax = std::getenv("MPC_HOST_LAX") != nullptr;
+    static std::unordered_map<std::string, int> seen;
+    if (lax && n.find("stack smashed") == std::string::npos && n != "abort") { if (!seen[n]++) std::fprintf(stderr, "guest: stub %s, lr=%08x\n", n.c_str(), i.r(14)); i.ret(0); return; }
+    std::fprintf(stderr, "guest: called %s (not supported), lr=%08x\n", n.c_str(), i.r(14));
+    std::abort();
+}
 
 std::vector<Entry> libc_table() {
     std::vector<Entry> t;
@@ -305,6 +334,117 @@ std::vector<Entry> libc_table() {
     add("__cxa_finalize", [](I&) {});
     add("__cxa_atexit", [](I& i) { i.ret(0); });
     add("__aeabi_atexit", [](I& i) { i.ret(0); });
+    add("__memset_chk", [](I& i) { std::memset(i.m + i.r(0), (int)i.r(1), i.r(2)); });
+    // pthread keys (one thread): a key is an index into a value table
+    add("pthread_key_create", [](I& i) { i.wr<uint32_t>(i.r(0), (uint32_t)i.keys.size()); i.keys.push_back(0); i.ret(0); });
+    add("pthread_key_delete", [](I& i) { i.ret(0); });
+    add("pthread_getspecific", [](I& i) { i.ret(i.r(0) < i.keys.size() ? i.keys[i.r(0)] : 0); });
+    add("pthread_setspecific", [](I& i) { if (i.r(0) < i.keys.size()) i.keys[i.r(0)] = i.r(1); i.ret(0); });
+    // --- what libstdc++ (loaded as a guest library) asks of libc: the "C" locale only, one thread, no real files ---
+    add("newlocale", [](I& i) { i.ret(i.r(2) ? i.r(2) : i.c_locale()); });
+    add("__newlocale", [](I& i) { i.ret(i.r(2) ? i.r(2) : i.c_locale()); });
+    add("duplocale", [](I& i) { i.ret(i.c_locale()); });
+    add("__duplocale", [](I& i) { i.ret(i.c_locale()); });
+    add("freelocale", [](I& i) { i.ret(0); });
+    add("__freelocale", [](I& i) { i.ret(0); });
+    add("uselocale", [](I& i) { i.ret(i.c_locale()); });
+    add("__uselocale", [](I& i) { i.ret(i.c_locale()); });
+    add("setlocale", [](I& i) { i.ret(i.cstr("C")); });
+    add("nl_langinfo_l", [](I& i) { i.ret(i.cstr("")); });
+    add("__nl_langinfo_l", [](I& i) { i.ret(i.cstr("")); });
+    add("__ctype_get_mb_cur_max", [](I& i) { i.ret(1); });
+    add("__strtod_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
+    add("strtold_l", [](I& i) { char* e; const double v = std::strtod(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_d(v); });
+    add("__strtof_l", [](I& i) { char* e; const float v = std::strtof(i.str(i.r(0)), &e); if (i.r(1)) i.wr<uint32_t>(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret_f(v); });
+    add("__strcoll_l", [](I& i) { i.ret((uint32_t)std::strcmp(i.str(i.r(0)), i.str(i.r(1)))); });
+    add("__strxfrm_l", [](I& i) { const size_t n = std::strlen(i.str(i.r(1))); if (i.r(2) > n) std::strcpy(i.str(i.r(0)), i.str(i.r(1))); i.ret((uint32_t)n); });
+    add("isspace", [](I& i) { i.ret(std::isspace((int)i.r(0)) ? 1 : 0); });
+    add("__errno_location", [](I& i) { if (!i.errno_p) i.errno_p = i.data(4, 4); i.ret(i.errno_p); });
+    add("strerror", [](I& i) { i.ret(i.cstr("error")); });
+    add("__assert_fail", [](I& i) { std::fprintf(stderr, "guest: assert %s at %s:%u\n", i.str(i.r(0)), i.str(i.r(1)), i.r(2)); std::abort(); });
+    add("syscall", [](I& i) { abort_named(i, "syscall"); });
+    add("pthread_create", [](I& i) { abort_named(i, "pthread_create (threads are not implemented)"); });
+    for (const char* n : {"pthread_cond_wait", "pthread_cond_signal", "pthread_cond_broadcast", "pthread_cond_destroy", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
+                          "pthread_rwlock_unlock", "pthread_detach", "sched_yield", "__cxa_thread_atexit_impl"})
+        add(n, [](I& i) { i.ret(0); });   // one thread: nothing to wait for or wake
+    add("memchr", [](I& i) { const void* p = std::memchr(i.m + i.r(0), (int)i.r(1), i.r(2)); i.ret(p ? (uint32_t)(static_cast<const uint8_t*>(p) - i.m) : 0); });
+    add("strdup", [](I& i) { i.ret(i.g.strdup(i.str(i.r(0)))); });
+    add("posix_memalign", [](I& i) { const gaddr p = i.malloc_(i.r(2) + i.r(1)); i.wr<uint32_t>(i.r(0), (p + i.r(1) - 1) & ~(i.r(1) - 1)); i.ret(0); });
+    add("__memcpy_chk", [](I& i) { std::memcpy(i.m + i.r(0), i.m + i.r(1), i.r(2)); i.ret(i.r(0)); });
+    add("__memmove_chk", [](I& i) { std::memmove(i.m + i.r(0), i.m + i.r(1), i.r(2)); i.ret(i.r(0)); });
+    add("__strcpy_chk", [](I& i) { std::strcpy(i.str(i.r(0)), i.str(i.r(1))); i.ret(i.r(0)); });
+    add("wcslen", [](I& i) { uint32_t n = 0; while (i.rd<uint32_t>(i.r(0) + 4 * n)) n++; i.ret(n); });
+    add("frexp", [](I& i) { int e; const double v = std::frexp(i.d(0), &e); i.wr<int32_t>(i.r(0), e); i.ret_d(v); });
+    add("ldexp", [](I& i) { i.ret_d(std::ldexp(i.d(0), (int)i.r(0))); });
+    add("ldexpf", [](I& i) { i.ret_f(std::ldexp(i.s(0), (int)i.r(0))); });
+    add("modf", [](I& i) { double ip; const double v = std::modf(i.d(0), &ip); std::memcpy(i.m + i.r(0), &ip, 8); i.ret_d(v); });
+    add("vsnprintf", [](I& i) { const gaddr b = i.r(0); const uint32_t n = i.r(1); i.put(b, n, i.format(i.str(i.r(2)), {i, 4, i.r(3)})); });   // armhf va_list = one pointer
+    // wide characters: ASCII only (the "C" locale)
+    add("wctob", [](I& i) { i.ret(i.r(0) < 128 ? i.r(0) : 0xFFFFFFFFu); });
+    add("btowc", [](I& i) { i.ret(i.r(0) < 128 ? i.r(0) : 0xFFFFFFFFu); });
+    add("mbrtowc", [](I& i) {
+        if (!i.r(1)) { i.ret(0); return; }
+        if (!i.r(2)) { i.ret(0xFFFFFFFEu); return; }
+        const uint8_t c = i.m[i.r(1)];
+        if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
+        if (i.r(0)) i.wr<uint32_t>(i.r(0), c);
+        i.ret(c ? 1 : 0); });
+    add("wcrtomb", [](I& i) { if (!i.r(0)) { i.ret(1); return; } if (i.r(1) >= 128) { i.ret(0xFFFFFFFFu); return; } i.m[i.r(0)] = (uint8_t)i.r(1); i.ret(1); });
+    add("mbsnrtowcs", [](I& i) {
+        const gaddr dst = i.r(0), src = i.r(1), nms = i.r(2), len = i.r(3); const gaddr s0 = i.rd<uint32_t>(src);
+        uint32_t n = 0;
+        for (; n < nms && (!dst || n < len); n++) {
+            const uint8_t c = i.m[s0 + n];
+            if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
+            if (dst) i.wr<uint32_t>(dst + 4 * n, c);
+            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+        }
+        if (dst) i.wr<uint32_t>(src, s0 + n);
+        i.ret(n); });
+    add("__mbsrtowcs_chk", [](I& i) {
+        const gaddr dst = i.r(0), src = i.r(1), len = i.r(2); const gaddr s0 = i.rd<uint32_t>(src);
+        uint32_t n = 0;
+        for (;; n++) {
+            if (dst && n >= len) break;
+            const uint8_t c = i.m[s0 + n];
+            if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
+            if (dst) i.wr<uint32_t>(dst + 4 * n, c);
+            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+        }
+        i.wr<uint32_t>(src, s0 + n); i.ret(n); });
+    add("wcsnrtombs", [](I& i) {
+        const gaddr dst = i.r(0), src = i.r(1), nwc = i.r(2), len = i.r(3); const gaddr s0 = i.rd<uint32_t>(src);
+        uint32_t n = 0;
+        for (; n < nwc && (!dst || n < len); n++) {
+            const uint32_t c = i.rd<uint32_t>(s0 + 4 * n);
+            if (c >= 128) { i.ret(0xFFFFFFFFu); return; }
+            if (dst) i.m[dst + n] = (uint8_t)c;
+            if (!c) { if (dst) i.wr<uint32_t>(src, 0); i.ret(n); return; }
+        }
+        if (dst) i.wr<uint32_t>(src, s0 + 4 * n);
+        i.ret(n); });
+    add("wmemchr", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) if (i.rd<uint32_t>(i.r(0) + 4 * k) == i.r(1)) { i.ret(i.r(0) + 4 * k); return; } i.ret(0); });
+    add("wmemcmp", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) { const uint32_t a = i.rd<uint32_t>(i.r(0) + 4 * k), b = i.rd<uint32_t>(i.r(1) + 4 * k); if (a != b) { i.ret(a < b ? 0xFFFFFFFFu : 1); return; } } i.ret(0); });
+    add("wmemcpy", [](I& i) { std::memcpy(i.m + i.r(0), i.m + i.r(1), 4 * (size_t)i.r(2)); i.ret(i.r(0)); });
+    add("__wmemcpy_chk", [](I& i) { std::memcpy(i.m + i.r(0), i.m + i.r(1), 4 * (size_t)i.r(2)); i.ret(i.r(0)); });
+    add("wmemmove", [](I& i) { std::memmove(i.m + i.r(0), i.m + i.r(1), 4 * (size_t)i.r(2)); i.ret(i.r(0)); });
+    add("wmemset", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) i.wr<uint32_t>(i.r(0) + 4 * k, i.r(1)); i.ret(i.r(0)); });
+    add("__wmemset_chk", [](I& i) { for (uint32_t k = 0; k < i.r(2); k++) i.wr<uint32_t>(i.r(0) + 4 * k, i.r(1)); i.ret(i.r(0)); });
+    add("wcscmp", [](I& i) { for (uint32_t k = 0;; k++) { const uint32_t a = i.rd<uint32_t>(i.r(0) + 4 * k), b = i.rd<uint32_t>(i.r(1) + 4 * k); if (a != b) { i.ret(a < b ? 0xFFFFFFFFu : 1); return; } if (!a) { i.ret(0); return; } } });
+    add("__wcscoll_l", [](I& i) { for (uint32_t k = 0;; k++) { const uint32_t a = i.rd<uint32_t>(i.r(0) + 4 * k), b = i.rd<uint32_t>(i.r(1) + 4 * k); if (a != b) { i.ret(a < b ? 0xFFFFFFFFu : 1); return; } if (!a) { i.ret(0); return; } } });
+    add("__towlower_l", [](I& i) { const uint32_t c = i.r(0); i.ret(c < 128 ? (uint32_t)std::tolower((int)c) : c); });
+    add("__towupper_l", [](I& i) { const uint32_t c = i.r(0); i.ret(c < 128 ? (uint32_t)std::toupper((int)c) : c); });
+    add("__wctype_l", [](I& i) { i.ret((uint32_t)std::wctype(i.str(i.r(0)))); });
+    add("__iswctype_l", [](I& i) { i.ret(i.r(0) < 128 ? (uint32_t)std::iswctype(i.r(0), (wctype_t)i.r(1)) : 0); });
+    add("secure_getenv", [](I& i) { i.ret(0); });
+    // no filesystem for guests: opens and reads fail the way a missing file would
+    for (const char* n : {"opendir", "readdir", "readdir64", "closedir", "fread", "fgets", "fwrite", "fputc", "fputs", "fclose", "usleep"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"fseek", "ftell", "mkdir", "access", "remove", "rename"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    add("rand", [](I& i) { i.ret((uint32_t)std::rand()); });
+    add("srand", [](I& i) { std::srand(i.r(0)); });
+    add("time", [](I& i) { const uint32_t t = (uint32_t)std::time(nullptr); if (i.r(0)) i.wr<uint32_t>(i.r(0), t); i.ret(t); });
+    add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
+    add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
     // C++ runtime
     for (const char* n : {"_Znwj", "_Znaj", "_ZnwjRKSt9nothrow_t", "_ZnajRKSt9nothrow_t"})
         add(n, [](I& i) { i.ret(i.malloc_(i.r(0))); });
@@ -424,6 +564,7 @@ float Guest::call_f(gaddr fn, const std::vector<uint32_t>& ints, const std::vect
 
 bool Guest::load(const std::string& path) {
     I& i = *impl_;
+    const gaddr bias = i.load_next;
     std::ifstream f(path, std::ios::binary);
     if (!f) { err_ = "cannot open " + path; return false; }
     std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
@@ -434,13 +575,27 @@ bool Guest::load(const std::string& path) {
     }
     const auto* ph = reinterpret_cast<const Elf32_Phdr*>(file.data() + eh->e_phoff);
     const Elf32_Dyn* dyn = nullptr;
+    uint32_t end = 0, tls_id = 0;
     for (int k = 0; k < eh->e_phnum; k++) {
+        if (ph[k].p_type == PT_LOAD) end = std::max(end, ph[k].p_vaddr + ph[k].p_memsz);
         if (ph[k].p_type == PT_LOAD) {
-            std::memcpy(mem_ + kLoad + ph[k].p_vaddr, file.data() + ph[k].p_offset, ph[k].p_filesz);
-            std::memset(mem_ + kLoad + ph[k].p_vaddr + ph[k].p_filesz, 0, ph[k].p_memsz - ph[k].p_filesz);
-        } else if (ph[k].p_type == PT_DYNAMIC) dyn = reinterpret_cast<const Elf32_Dyn*>(mem_ + kLoad + ph[k].p_vaddr);
+            std::memcpy(mem_ + bias + ph[k].p_vaddr, file.data() + ph[k].p_offset, ph[k].p_filesz);
+            std::memset(mem_ + bias + ph[k].p_vaddr + ph[k].p_filesz, 0, ph[k].p_memsz - ph[k].p_filesz);
+        } else if (ph[k].p_type == PT_TLS) {
+            // single-threaded: one block per module, at tp + 8 + offset (ARM TLS variant 1)
+            const uint32_t al = std::max<uint32_t>(ph[k].p_align, 1);
+            i.tls_used = (i.tls_used + al - 1) / al * al;
+            const gaddr blk = kTp + 8 + i.tls_used;
+            if (blk + ph[k].p_memsz > kLoad) { err_ = "TLS area full"; return false; }
+            std::memset(mem_ + blk, 0, ph[k].p_memsz);
+            std::memcpy(mem_ + blk, file.data() + ph[k].p_offset, ph[k].p_filesz);
+            i.tls.push_back({blk, i.tls_used});
+            i.tls_used += ph[k].p_memsz;
+            tls_id = (uint32_t)i.tls.size();
+        } else if (ph[k].p_type == PT_DYNAMIC) dyn = reinterpret_cast<const Elf32_Dyn*>(mem_ + bias + ph[k].p_vaddr);
     }
     if (!dyn) { err_ = "no PT_DYNAMIC"; return false; }
+    i.load_next = (bias + end + 0xFFFFu) & ~0xFFFFu;
     // dynamic section (read after the copy: it lives in a loaded segment)
     uint32_t symtab = 0, strtab = 0, rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
     for (const Elf32_Dyn* d = reinterpret_cast<const Elf32_Dyn*>(mem_ + (reinterpret_cast<const uint8_t*>(dyn) - mem_)); d->d_tag != DT_NULL; d++) {
@@ -461,54 +616,67 @@ bool Guest::load(const std::string& path) {
     uint32_t nsyms = 0;
     const auto* sh = reinterpret_cast<const Elf32_Shdr*>(file.data() + eh->e_shoff);
     for (int k = 0; k < eh->e_shnum; k++) if (sh[k].sh_type == SHT_DYNSYM) nsyms = sh[k].sh_size / sizeof(Elf32_Sym);
-    const auto* syms = reinterpret_cast<const Elf32_Sym*>(mem_ + kLoad + symtab);
-    const char* strs = reinterpret_cast<const char*>(mem_ + kLoad + strtab);
+    const auto* syms = reinterpret_cast<const Elf32_Sym*>(mem_ + bias + symtab);
+    const char* strs = reinterpret_cast<const char*>(mem_ + bias + strtab);
 
     // imports -> thunks
     std::unordered_map<std::string, Thunk> table;
     for (auto& e : libc_table()) table.emplace(e.name, std::move(e.fn));
     std::vector<gaddr> symaddr(nsyms, 0);
+    const size_t missing_before = missing_.size();
     for (uint32_t k = 1; k < nsyms; k++) {
         const std::string name = strs + syms[k].st_name;
         if (syms[k].st_shndx != SHN_UNDEF) {
-            symaddr[k] = kLoad + syms[k].st_value;
-            if (ELF32_ST_BIND(syms[k].st_info) != STB_LOCAL) i.dynsyms[name] = symaddr[k];
+            symaddr[k] = bias + syms[k].st_value;
+            if (ELF32_ST_TYPE(syms[k].st_info) == STT_TLS) symaddr[k] = syms[k].st_value;   // an offset in this module's TLS block
+            if (ELF32_ST_BIND(syms[k].st_info) != STB_LOCAL && ELF32_ST_TYPE(syms[k].st_info) != STT_TLS) i.dynsyms.emplace(name, symaddr[k]);
             continue;
         }
         if (name.empty()) continue;
+        if (auto d = i.dynsyms.find(name); d != i.dynsyms.end()) { symaddr[k] = d->second; continue; }   // a library loaded before this one
         if (is_data_import(name)) {
-            const gaddr a = i.data(64);
+            auto& da = i.data_by_name[name];
+            if (da) { symaddr[k] = da; continue; }
+            const gaddr a = da = i.data(64);
             if (name == "__stack_chk_guard") i.wr<uint32_t>(a, 0xC0FFEE00u);
             symaddr[k] = a;
             continue;
         }
-        if (name == "__ctype_b_loc") {
+        if (name == "__ctype_b_loc" && !i.thunk_by_name.count(name)) {
             // glibc's table is indexed from -128; both armhf and x86-64 glibc are little-endian with the same bits
             const gaddr tbl = i.data(384 * 2, 4), pp = i.data(4, 4);
             std::memcpy(mem_ + tbl, *__ctype_b_loc() - 128, 384 * 2);
             i.wr<uint32_t>(pp, tbl + 256);
-            symaddr[k] = i.add_thunk(name, [pp](I& ii) { ii.ret(pp); });
+            symaddr[k] = i.thunk_for(name, [pp](I& ii) { ii.ret(pp); });
+            continue;
+        }
+        if (name == "pthread_once") {   // guest code, so the init routine runs without a nested call: if (!*once) { *once = 1; tail-call init }
+            symaddr[k] = i.thunk_by_name.count(name) ? i.thunk_by_name[name] : (i.thunk_by_name[name] = i.stub({0xE5902000, 0xE3520000, 0x112FFF1E, 0xE3A02001, 0xE5802000, 0xE12FFF11}));
             continue;
         }
         auto it = table.find(name);
-        if (it != table.end()) { symaddr[k] = i.add_thunk(name, it->second); continue; }
+        if (it != table.end()) { symaddr[k] = i.thunk_for(name, it->second); continue; }
         if (ELF32_ST_BIND(syms[k].st_info) == STB_WEAK) { symaddr[k] = 0; continue; }
         missing_.push_back(name);
-        symaddr[k] = i.add_thunk(name, [name](I& ii) { abort_named(ii, name); });
+        symaddr[k] = i.thunk_for(name, [name](I& ii) { abort_named(ii, name); });
     }
 
+    for (size_t k = missing_before; k < missing_.size(); k++) std::fprintf(stderr, "  no thunk for import: %s\n", missing_[k].c_str());
     // relocations
     auto apply = [&](uint32_t at, uint32_t size) -> bool {
         for (uint32_t off = 0; off < size; off += sizeof(Elf32_Rel)) {
-            const auto* rr = reinterpret_cast<const Elf32_Rel*>(mem_ + kLoad + at + off);
+            const auto* rr = reinterpret_cast<const Elf32_Rel*>(mem_ + bias + at + off);
             const uint32_t type = ELF32_R_TYPE(rr->r_info), sym = ELF32_R_SYM(rr->r_info);
-            const gaddr P = kLoad + rr->r_offset;
+            const gaddr P = bias + rr->r_offset;
             const uint32_t S = sym < nsyms ? symaddr[sym] : 0;
             switch (type) {
-            case R_ARM_RELATIVE: i.wr<uint32_t>(P, i.rd<uint32_t>(P) + kLoad); break;
+            case R_ARM_RELATIVE: i.wr<uint32_t>(P, i.rd<uint32_t>(P) + bias); break;
             case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: i.wr<uint32_t>(P, S); break;
             case R_ARM_ABS32: i.wr<uint32_t>(P, i.rd<uint32_t>(P) + S); break;
             case R_ARM_NONE: break;
+            case R_ARM_TLS_DTPMOD32: i.wr<uint32_t>(P, tls_id); break;                                   // this module (symbols are local to it)
+            case R_ARM_TLS_DTPOFF32: i.wr<uint32_t>(P, i.rd<uint32_t>(P) + S); break;
+            case R_ARM_TLS_TPOFF32: i.wr<uint32_t>(P, i.rd<uint32_t>(P) + S + 8 + (tls_id ? i.tls[tls_id - 1].off : 0)); break;
             default: err_ = "unsupported relocation type " + std::to_string(type); return false;
             }
         }
@@ -517,9 +685,9 @@ bool Guest::load(const std::string& path) {
     if (!apply(rel, relsz) || !apply(jmprel, pltrelsz)) return false;
 
     // constructors
-    if (init) call(kLoad + init, {});
+    if (init) call(bias + init, {});
     for (uint32_t k = 0; k < init_arraysz / 4; k++) {
-        const gaddr fn = i.rd<uint32_t>(kLoad + init_array + 4 * k);
+        const gaddr fn = i.rd<uint32_t>(bias + init_array + 4 * k);
         if (fn && fn != 0xffffffffu) call(fn, {});
     }
     return true;

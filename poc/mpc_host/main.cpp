@@ -49,8 +49,16 @@ struct Emulated : Plugin {
     gaddr eff = 0, disp = 0, proc = 0, buf_l = 0, buf_r = 0, outs = 0, ins = 0, evs = 0, ev = 0;
     int nev = 0;
     bool open(const char* path) {
+        // MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6 loads armhf libraries first; the plugin's imports then resolve to them.
+        if (const char* libs = std::getenv("MPC_HOST_LIBS")) {
+            std::string l = libs;
+            for (size_t b = 0; b < l.size();) {
+                size_t e = l.find(':', b); if (e == std::string::npos) e = l.size();
+                if (e > b && !g.load(l.substr(b, e - b))) { std::fprintf(stderr, "load %s: %s\n", l.substr(b, e - b).c_str(), g.error().c_str()); return false; }
+                b = e + 1;
+            }
+        }
         if (!g.load(path)) { std::fprintf(stderr, "load: %s\n", g.error().c_str()); return false; }
-        for (auto& m : g.missing()) std::fprintf(stderr, "  no thunk for import: %s\n", m.c_str());
         const gaddr main = g.symbol("VSTPluginMain");
         if (!main) { std::fprintf(stderr, "no VSTPluginMain\n"); return false; }
         g_time = g.alloc(sizeof(GuestTime));

@@ -162,11 +162,32 @@ these by hand is the wrong shape. The better route is to load the device's armhf
 ELF loader and keep thunks only for libc and syscalls. That also gives exceptions and `std::thread` for free once `pthread` and `futex` exist.
 TLS relocations need a per-guest TLS block and `__aeabi_read_tp`.
 
+## Guest libraries, TLS (2026-11-06, offline)
+
+The loader now takes several modules, each at its own base (64 KB aligned from `0x100000`). An import resolves first to a symbol exported
+by a module loaded earlier, then to the host's libc thunks. `MPC_HOST_LIBS=libgcc_s.so.1:libstdc++.so.6` loads armhf libraries before
+the plugin; the test used the armhf cross sysroot's `/usr/arm-linux-gnueabihf/lib` (glibc 2.43 era), not a device's libraries. `libm.so.6` does not load
+(IFUNC relocations): the host's own libm thunks are used. TLS: one block per module at the thread pointer (`0x000C0000`, ARM variant 1),
+`R_ARM_TLS_DTPMOD32/DTPOFF32/TPOFF32`, `__tls_get_addr`, `__aeabi_read_tp`; one thread only. `pthread_once` is a few ARM instructions
+in guest memory (so the init routine runs without a nested call from a thunk, which is still unsupported). Also added: a "C"-locale-only
+set of locale and wide-character thunks, pthread keys, mutex/condition no-ops, `vsnprintf`, `errno`, and failing file and directory calls.
+`MPC_HOST_LAX=1` logs an unsupported import once and returns 0, to list what a plugin really calls.
+
+Re-run of the survey with `MPC_HOST_LIBS` set (same 34 files), parameter and chunk check:
+
+| Result | Plugins |
+|---|---|
+| Runs; round-trip ok | Dexed DX7 (2285 B chunk, C++ and `std::string`), jn106 (512 B), profit5 (186 B), trcw78 (330 B), model303 and acid303 (301 B); OTT and both Reverbicon builds set parameters but have no chunk |
+| Runs; chunk restore wrong (param 0 reads 1.000) | morpho_pe, clementine_xt: same symptom, both on parameter 0; not yet compared with a native build |
+| Stops on one import | `frexpf`, `fma` (8 airwin2rack), `localtime` (machinedrum_one, monomodule), `dlopen`/`dladdr` (machinedrum tap, clementine), `sigaction` (cratedigger), `__xstat` (lucky dip), `getrlimit` (MM-303), `pthread_attr_init` (model72), `snd_seq_open` (maze, ALSA), `pthread_create` (jv880), `abort` (rhythmbank) |
+
+Dexed's C++ exceptions are not exercised yet: the unwinder needs `dl_iterate_phdr`, which calls back into guest code.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks: done 2026-11-06 (offline, x86 Linux): see "Params and state". Next: threads, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Next: the simple missing imports, `dl_iterate_phdr` and exceptions, threads, the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
