@@ -104,18 +104,21 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::unordered_map<gaddr, hostfs::Dir> dirs;
     std::string plugin_dir;
     std::vector<std::string> mod_paths;   // parallel to mods
+    // host paths are kept with '/' separators (Windows accepts them) and no trailing slash, so guest and host paths map both ways whatever the host's own style
+    static std::string slashes(std::string p) { for (char& c : p) if (c == '\\') c = '/'; while (p.size() > 1 && p.back() == '/') p.pop_back(); return p; }
+    static std::string root_dir() { const char* r = std::getenv("MPC_HOST_ROOT"); return r ? slashes(r) : std::string(); }
     bool hostpath(const char* gp, std::string& out) {
         std::string p = gp ? gp : "";
         if (p.empty()) return false;
         if (p[0] != '/') p = "/" + p;
         if (p.find("/../") != std::string::npos || (p.size() > 3 && p.compare(p.size() - 3, 3, "/..") == 0)) return false;
         if (p == "/plugin" || p.rfind("/plugin/", 0) == 0) { out = plugin_dir + p.substr(7); return true; }
-        if (const char* r = std::getenv("MPC_HOST_ROOT")) { out = std::string(r) + p; return true; }
+        if (const std::string r = root_dir(); !r.empty()) { out = r + p; return true; }
         return false;
     }
     std::string guestpath(const std::string& hp) {
         if (!plugin_dir.empty() && hp.rfind(plugin_dir, 0) == 0) return "/plugin" + hp.substr(plugin_dir.size());
-        if (const char* r = std::getenv("MPC_HOST_ROOT")) { const std::string rr = r; if (hp.rfind(rr, 0) == 0) return hp.substr(rr.size()); }
+        if (const std::string rr = root_dir(); !rr.empty() && hp.rfind(rr, 0) == 0) return hp.substr(rr.size());
         return hp;
     }
     void set_errno(int e) { if (!errno_p) errno_p = data(4, 4); wr<int32_t>(errno_p, e); }
@@ -890,7 +893,8 @@ std::vector<Entry> libc_table() {
     auto out_file = [](I& i, gaddr f) -> FILE* { FILE* h = i.file_of(f); return h ? h : stderr; };
     auto fopen_ = [](I& i) {
         std::string hp; if (!i.hostpath(i.str(i.r(0)), hp)) { i.set_errno(2); i.ret(0); return; }
-        FILE* f = std::fopen(hp.c_str(), i.str(i.r(1)));
+        std::string mode = i.str(i.r(1)); if (mode.find('b') == std::string::npos) mode += 'b';   // the guest expects Linux semantics: no newline translation
+        FILE* f = std::fopen(hp.c_str(), mode.c_str());
         if (!f) { i.set_errno(errno); i.ret(0); return; }
         const gaddr h = i.malloc_(16); i.files[h] = f; i.ret(h); };
     add("fopen", fopen_); add("fopen64", fopen_);
@@ -1349,7 +1353,7 @@ bool Guest::load(const std::string& path) {
     i.mod_paths.push_back(path);
     i.register_phdr(bias, path, file.data() + eh->e_phoff, eh->e_phnum, eh->e_phentsize);
     if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + end);
-    i.plugin_dir = std::filesystem::path(path).parent_path().string();
+    i.plugin_dir = Guest::Impl::slashes(std::filesystem::path(path).parent_path().generic_string());
     // dynamic section (read after the copy: it lives in a loaded segment)
     uint32_t symtab = 0, strtab = 0, rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
     for (const Elf32_Dyn* d = reinterpret_cast<const Elf32_Dyn*>(mem_ + (reinterpret_cast<const uint8_t*>(dyn) - mem_)); d->d_tag != DT_NULL; d++) {
@@ -1463,7 +1467,7 @@ bool Guest::load64(const std::string& path) {
     i.mod_paths.push_back(path);
     i.register_phdr(bias, path, file.data() + eh->e_phoff, eh->e_phnum, eh->e_phentsize);
     if (std::getenv("MPC_HOST_TRACE")) std::fprintf(stderr, "module %s at %08x-%08x\n", path.c_str(), bias, bias + (uint32_t)end);
-    i.plugin_dir = std::filesystem::path(path).parent_path().string();
+    i.plugin_dir = Guest::Impl::slashes(std::filesystem::path(path).parent_path().generic_string());
     uint64_t symtab = 0, strtab = 0, rela = 0, relasz = 0, jmprel = 0, pltrelsz = 0, init = 0, init_array = 0, init_arraysz = 0;
     for (const Elf64_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
