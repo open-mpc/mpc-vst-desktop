@@ -9,7 +9,7 @@ OUT=${MPC_HOST_BUILD_WIN:-$HERE/build-win}; B=${MPC_HOST_BUILD:-$HERE/build}
 ARM_LIBDIR=${ARM_LIBDIR:-/usr/arm-linux-gnueabihf/lib}; A64_LIBDIR=${A64_LIBDIR:-/usr/aarch64-linux-gnu/lib}
 ARM_DOC=${ARM_DOC:-/usr/share/doc/libstdc++6-armhf-cross}; A64_DOC=${A64_DOC:-/usr/share/doc/libstdc++6-arm64-cross}
 [ -n "${MINGW_BIN:-}" ] && export PATH=$MINGW_BIN:$PATH
-VERSION=$("$OUT/mpc_host.exe" --version 2>/dev/null | awk '{print $2}' || true); : "${VERSION:=$(git -C "$REPO" describe --always --dirty)}"
+VERSION=$("$OUT/mpc_host.exe" --version 2>/dev/null | tr -d '\r' | awk '{print $2}' || true); : "${VERSION:=$(git -C "$REPO" describe --always --dirty)}"
 NAME=mpc_host-$VERSION-windows-x64; STAGE=$(mktemp -d)/$NAME; mkdir -p "$STAGE/guestlibs/armv7" "$STAGE/guestlibs/aarch64" "$STAGE/fixtures/armv7" "$STAGE/fixtures/aarch64" "$STAGE/licenses" "$STAGE/data"
 x86_64-w64-mingw32-strip -o "$STAGE/mpc_host.exe" "$OUT/mpc_host.exe"
 cp "$OUT/guest_helpers.so" "$OUT/guest_helpers64.so" "$STAGE/"

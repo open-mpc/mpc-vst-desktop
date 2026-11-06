@@ -329,6 +329,14 @@ Checked:
   temporary files were removed afterwards.
 - **Not checked:** a Windows machine without WSL (the same `.exe`, but nothing here exercises installers, long-path settings or antivirus/SmartScreen behaviour on an unsigned program), a build with MSVC, and the CI job (`continue-on-error`, never seen to run).
 
+## Windows package (2026-11-06)
+
+`poc/mpc_host/package_windows.sh` builds `dist/mpc_host-<version>-windows-x64.zip` (3.8 MB; `dist/` is not committed): the stripped `mpc_host.exe`, the two guest helper libraries, `guestlibs/` (libstdc++ and
+libgcc_s for armv7 and aarch64, from the Ubuntu cross packages, with their copyright files; the host loads them by itself when `MPC_HOST_LIBS` is not set), the eight test plugins in `fixtures/`, `test.bat`
+(all eight fixtures plus the `--check` verdict), `check.bat <plugin>`, `render.bat <plugin> [seconds]` (writes a WAV), a README and licence notices. No plugin or ROM is included. Checked 2026-11-06 by unzipping a copy on
+the author's Windows 11 machine and running `test.bat` (all 8 passed), `check.bat` and `render.bat` on a real plugin (Maze Voice: ok at 6%, a 3 s stereo 44.1 kHz WAV with peak 0.222). The first package had a carriage return in its
+name (the version came from the Windows program's output); fixed before release. The executable is unsigned.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
