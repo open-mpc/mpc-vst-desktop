@@ -15,7 +15,10 @@
 # No editor yet on Windows (a DAW shows its generic parameter view); --install is not supported there (copy the bundle to
 # %CommonProgramFiles%\VST3).
 set -euo pipefail
-MV="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"   # this repo (mpc-vst-desktop)
+# mpc-vst-plugins: the engine contract, gen_vst.py, adapters and fonts. The pinned submodule, or MPC_VST_PLUGINS=<checkout>.
+MV="$(cd "${MPC_VST_PLUGINS:-$HERE/mpc-vst-plugins}" && pwd)"
+[ -f "$MV/tools/gen_vst.py" ] || { echo "mpc-vst-plugins not found at $MV: run git submodule update --init, or set MPC_VST_PLUGINS" >&2; exit 1; }
 CFG="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 eval "$(python3 "$MV/tools/gen_vst.py" "$CFG" --shell)"
 python3 "$MV/tools/gen_vst.py" "$CFG" --params-h
@@ -68,14 +71,14 @@ OBJS=""
 for f in $SOURCES; do
   o="$OBJ/${f//\//_}.o"
   case "$f" in
-    *.cpp|*.cc|*.cxx) $CXX $OPT -std=gnu++11 $CFLAGS -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o" ;;
-    *) $CC $OPT -std=gnu11 $CFLAGS -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o" ;;
+    *.cpp|*.cc|*.cxx) $CXX $OPT -std=gnu++11 $CFLAGS -I"$HERE/wrapper" -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o" ;;
+    *) $CC $OPT -std=gnu11 $CFLAGS -I"$HERE/wrapper" -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o" ;;
   esac
   OBJS="$OBJS $o"
 done
-for f in "$MV/wrapper/vst3_wrap.c" $ADAPTER_SRC; do
+for f in "$HERE/wrapper/vst3_wrap.c" $ADAPTER_SRC; do
   o="$OBJ/$(basename "$f").o"
-  $CC $OPT -std=gnu11 $EDITOR_CF -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o"
+  $CC $OPT -std=gnu11 $EDITOR_CF -I"$HERE/wrapper" -I"$MV/wrapper" -I"$PORT/build" -c "$f" -o "$o"
   OBJS="$OBJS $o"
 done
 if [ "$ARCH" = x86_64-win ]; then
@@ -90,7 +93,7 @@ SUBDIR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("d
 [ -z "$SUBDIR" ] || mkdir -p "$BUNDLE/Contents/$ARCH/$SUBDIR"
 if [ -n "$EDITOR_CF" ]; then   # the skin, flattened for the editor, and its fonts (SIL OFL: the licence goes with them)
   RES="$BUNDLE/Contents/Resources/skin"
-  python3 "$MV/tools/desktop_skin.py" "$SKIN" "$RES"
+  python3 "$HERE/tools/desktop_skin.py" "$SKIN" "$RES"
   cp "$MV"/tools/html_art/fonts/TitilliumWeb-{Regular,SemiBold,Bold}.ttf "$MV/tools/html_art/fonts/OFL.txt" "$RES/"
 fi
 if [ "$ARCH" = x86_64-win ]; then
