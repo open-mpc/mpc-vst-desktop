@@ -18,7 +18,7 @@ using namespace mpchost;
 namespace {
 constexpr int kBlock = 128;
 constexpr double kRate = 44100.0;
-enum { effOpen = 0, effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12, effProcessEvents = 25, effGetEffectName = 45 };
+enum { effOpen = 0, effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12, effGetChunk = 23, effSetChunk = 24, effProcessEvents = 25, effGetEffectName = 45 };
 
 struct Plugin {
     virtual ~Plugin() = default;
@@ -26,6 +26,10 @@ struct Plugin {
     virtual int num_params() = 0;
     virtual int num_outputs() = 0;
     virtual void start() = 0;
+    virtual void set_param(int i, float v) = 0;
+    virtual float get_param(int i) = 0;
+    virtual std::vector<uint8_t> get_chunk() = 0;   // empty if the plugin has no state
+    virtual bool set_chunk(const std::vector<uint8_t>& c) = 0;
     virtual void midi(const uint8_t m[3]) = 0;   // one event at frame 0 of the next block
     virtual void process(float* l, float* r) = 0;
 };
@@ -68,6 +72,24 @@ struct Emulated : Plugin {
     int num_params() override { return (int32_t)g.rd32(eff + 24); }
     int num_outputs() override { return (int32_t)g.rd32(eff + 32); }
     void start() override { dispatch(effOpen, 0, 0, 0, 0); dispatch(effSetSampleRate, 0, 0, 0, (float)kRate); dispatch(effSetBlockSize, 0, kBlock, 0, 0); dispatch(effMainsChanged, 0, 1, 0, 0); }
+    void set_param(int i, float v) override { g.call(g.rd32(eff + 12), {eff, (uint32_t)i}, {v}); }   // setParameter at byte 12
+    float get_param(int i) override { return g.call_f(g.rd32(eff + 16), {eff, (uint32_t)i}); }        // getParameter at byte 16
+    std::vector<uint8_t> get_chunk() override {
+        const gaddr pp = g.alloc(4); g.wr32(pp, 0);
+        const int32_t n = (int32_t)dispatch(effGetChunk, 0, 0, pp, 0);
+        const gaddr data = g.rd32(pp);
+        std::vector<uint8_t> c;
+        if (n > 0 && data) c.assign(g.host(data), g.host(data) + n);
+        g.dealloc(pp);
+        return c;
+    }
+    bool set_chunk(const std::vector<uint8_t>& c) override {
+        const gaddr b = g.alloc((uint32_t)c.size());
+        std::memcpy(g.host(b), c.data(), c.size());
+        const bool ok = dispatch(effSetChunk, 0, (int32_t)c.size(), b, 0) != 0;
+        g.dealloc(b);
+        return ok;
+    }
     void midi(const uint8_t m[3]) override {
         const gaddr e = ev + 32 * nev;
         std::memset(g.host(e), 0, 32);
@@ -126,6 +148,14 @@ struct Native : Plugin {
     int num_params() override { return e->numParams; }
     int num_outputs() override { return e->numOutputs; }
     void start() override { e->dispatcher(e, effOpen, 0, 0, nullptr, 0); e->dispatcher(e, effSetSampleRate, 0, 0, nullptr, (float)kRate); e->dispatcher(e, effSetBlockSize, 0, kBlock, nullptr, 0); e->dispatcher(e, effMainsChanged, 0, 1, nullptr, 0); }
+    void set_param(int i, float v) override { e->setParameter(e, i, v); }
+    float get_param(int i) override { return e->getParameter(e, i); }
+    std::vector<uint8_t> get_chunk() override {
+        void* d = nullptr;
+        const intptr_t n = e->dispatcher(e, effGetChunk, 0, 0, &d, 0);
+        return n > 0 && d ? std::vector<uint8_t>((uint8_t*)d, (uint8_t*)d + n) : std::vector<uint8_t>();
+    }
+    bool set_chunk(const std::vector<uint8_t>& c) override { return e->dispatcher(e, effSetChunk, 0, (int32_t)c.size(), (void*)c.data(), 0) != 0; }
     void midi(const uint8_t m[3]) override { std::memset(&ev[nev], 0, sizeof ev[nev]); ev[nev].type = 1; ev[nev].byteSize = 32; std::memcpy(ev[nev].midi, m, 3); evs.ev[nev] = &ev[nev]; nev++; }
     void process(float* l, float* r) override {
         if (nev) { evs.n = nev; evs.reserved = 0; e->dispatcher(e, effProcessEvents, 0, 0, &evs, 0); nev = 0; }
@@ -183,6 +213,25 @@ void report(const char* what, const Run& r) {
     std::printf("%-9s median %7.1f us  p99 %7.1f us  max %7.1f us  (%.1f%% of a %.0f us block, median)  rms %.4f peak %.3f\n",
                 what, med, p99, us.back(), 100 * med / budget, budget, std::sqrt(sum / r.l.size()), peak);
 }
+// Parameters and state: find a parameter that reads back what was set (readouts do not), set it, save the chunk, change it,
+// restore the chunk, and expect the first value back.
+bool state_check(const char* what, Plugin& p) {
+    int idx = -1;
+    for (int i = 0; i < p.num_params() && idx < 0; i++) { p.set_param(i, 0.25f); if (std::fabs(p.get_param(i) - 0.25f) < 0.02f) idx = i; }
+    if (idx < 0) { std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
+    p.set_param(idx, 0.25f);
+    const float a = p.get_param(idx);
+    const auto chunk = p.get_chunk();
+    p.set_param(idx, 0.75f);
+    const float b = p.get_param(idx);
+    const bool set_ok = std::fabs(a - 0.25f) < 0.02f && std::fabs(b - 0.75f) < 0.02f;
+    if (chunk.empty()) { std::printf("%-9s state: param %d %.3f -> %.3f (%s), no chunk\n", what, idx, a, b, set_ok ? "ok" : "FAILED"); return set_ok; }
+    const bool restored = p.set_chunk(chunk);
+    const float c = p.get_param(idx);
+    const bool ok = set_ok && restored && std::fabs(c - a) < 0.02f;
+    std::printf("%-9s state: param %d %.3f -> %.3f, chunk %zu bytes, restored %.3f (%s)\n", what, idx, a, b, chunk.size(), c, ok ? "ok" : "FAILED");
+    return ok;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -197,6 +246,7 @@ int main(int argc, char** argv) {
     const Run a = render(*emu, blocks);
     report("emulated", a);
     write_wav(prefix + "_emulated.wav", a);
+    bool ok = state_check("emulated", *emu);
 
     if (argc > 2 && std::strcmp(argv[2], "-")) {
         auto nat = std::make_unique<Native>();
@@ -204,9 +254,10 @@ int main(int argc, char** argv) {
         const Run b = render(*nat, blocks);
         report("native", b);
         write_wav(prefix + "_native.wav", b);
+        ok &= state_check("native", *nat);
         double diff = 0, ref = 0, maxd = 0;
         for (size_t k = 0; k < a.l.size(); k++) { const double d = a.l[k] - b.l[k]; diff += d * d; ref += (double)b.l[k] * b.l[k]; maxd = std::fmax(maxd, std::fabs(d)); }
         std::printf("difference: %.1f dB below the native signal, max %.5f\n", 10 * std::log10(ref / (diff + 1e-30)), maxd);
     }
-    return 0;
+    return ok ? 0 : 1;
 }

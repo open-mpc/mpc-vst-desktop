@@ -1,0 +1,9 @@
+{
+  "name": "MPC Host State Test",
+  "vendor": "open-mpc",
+  "uid": "HStT",
+  "version": 1000,
+  "so": "statetest.so",
+  "params": "params.json",
+  "build": {"root": ".", "sources": ["engine.c"], "cflags": [], "libs": ["-lm"]}
+}

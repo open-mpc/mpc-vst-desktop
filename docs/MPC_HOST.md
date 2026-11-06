@@ -130,14 +130,24 @@ Results, Acid-303 1.0.2 source, 10 s, 128-frame blocks at 44.1 kHz (a 2902 µs b
   should pre-render at load time to warm the JIT up, and render one block ahead.
 
 Found while building it: armv7 code uses `LDREX`/`STREX` (the C++ runtime's atomics), so dynarmic needs an
-`ExclusiveMonitor` even with one CPU. Not done yet: threads, files (`fopen` returns NULL), state chunks, parameter
-calls from the driver, aarch64 (Gen2) `.so` files, and Windows/macOS builds of the prototype.
+`ExclusiveMonitor` even with one CPU. Not done yet: threads, files (`fopen` returns NULL), aarch64 (Gen2) `.so` files, and Windows/macOS builds of the prototype.
+
+## Params and state
+
+The driver calls `setParameter`/`getParameter` (AEffect bytes 12 and 16, floats in `s0`/`r0`-`r1` as the armhf ABI says) and
+`effGetChunk`/`effSetChunk` (the chunk pointer is a guest pointer the driver copies out of and into guest memory). After the render it
+finds a parameter that reads back what was set (readouts do not), saves the chunk, changes the parameter, restores the chunk and
+expects the first value; the exit code is 1 if that fails. `poc/mpc_host/statetest/` is a small engine fixture for it (two parameters
+and a `state` string). Checked 2026-11-06, offline: the emulated armv7 build and a native x86 build of the fixture both print
+`param 0 0.250 -> 0.750, chunk 18 bytes, restored 0.250 (ok)`. The fixture's `sscanf` found a missing import, so the host now
+thunks `sscanf` (`%d %i %u %x %o %f %g %s %c %n %%`, `l`, `*`; widths ignored). The songpos and uiprobe probes have no settable
+parameter and report that. Not checked: a real port's chunk (Acid-303 and the others live in their own repos), threads.
 
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Next: params and state chunks, threads, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks: done 2026-11-06 (offline, x86 Linux): see "Params and state". Next: threads, the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 

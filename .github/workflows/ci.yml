@@ -42,3 +42,5 @@ jobs:
           key: dynarmic-${{ hashFiles('poc/mpc_host/build.sh') }}
       - name: Build the prototype and run an armv7 probe emulated
         run: poc/mpc_host/smoke.sh
+      - name: Parameters and state chunks round-trip emulated
+        run: poc/mpc_host/smoke.sh poc/mpc_host/statetest/vst.json
