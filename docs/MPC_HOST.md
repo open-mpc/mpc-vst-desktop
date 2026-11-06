@@ -143,6 +143,25 @@ and a `state` string). Checked 2026-11-06, offline: the emulated armv7 build and
 thunks `sscanf` (`%d %i %u %x %o %f %g %s %c %n %%`, `l`, `*`; widths ignored). The songpos and uiprobe probes have no settable
 parameter and report that. Not checked: a real port's chunk (Acid-303 and the others live in their own repos), threads.
 
+## Survey of local builds (2026-11-06, offline)
+
+`mpc_host <armv7 .so> - 1` on the 32-bit ARM `VSTPluginMain` builds in the author's `~/mpc-vst-*` folders (34 files, some of them copies of the same plugin; aarch64
+files are not loadable yet). Results:
+
+| Result | Plugins |
+|---|---|
+| Runs; parameter and chunk round-trip ok | trcw78 (330 B chunk), model303 and acid303 (301 B), boris (361 B, built from source by `smoke.sh`) |
+| Runs; chunk restore wrong | morpho_pe (315 params, 407 B chunk): after `effSetChunk` the parameter reads 1.000, not 0.250. Not yet known if the host or the port is at fault: needs a native x86 build to compare |
+| Load error `unsupported relocation type 17` (`R_ARM_TLS_DTPMOD32`: `thread_local` data) | rhythmbank, machinedrum (3), cratedigger (2), maze combo and sequencer, model72, monomodule_fx, MM-303, the Dexed arm32 release |
+| Stops on a missing import | jv880 (`access`), dx7 (`std::ios_base::Init`), reverbicon224 and OTT (`steady_clock::now`, `wcslen`), clementine (`rand`, `dladdr`), the 8 airwin2rack plugins (`rand`), jn106 (`__aeabi_idiv`), profit5 (`ldexpf`), lucky dip (`std::condition_variable`), plugin manager (`pthread_cond_init`) |
+
+The missing imports, over all of them, are mostly not libc: about 70 are libstdc++ (`std::string`, `std::thread`, `std::condition_variable`,
+`_Rb_tree_*`, the `__throw_*` family, C++ exceptions), plus libgcc (`__aeabi_idivmod` 16 files, `__aeabi_ldivmod`, `__aeabi_unwind_cpp_pr0/1`,
+`__cxa_end_cleanup`) and libc stdio, dirent and pthread calls (`fclose` 15, `fseek` 13, `rand` 10, `opendir`/`readdir` 7). Thunking all of
+these by hand is the wrong shape. The better route is to load the device's armhf `libstdc++.so.6`, `libgcc_s.so.1` and `libm` through the same
+ELF loader and keep thunks only for libc and syscalls. That also gives exceptions and `std::thread` for free once `pthread` and `futex` exist.
+TLS relocations need a per-guest TLS block and `__aeabi_read_tp`.
+
 ## Next steps
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
