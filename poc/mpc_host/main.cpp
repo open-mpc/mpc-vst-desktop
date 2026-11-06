@@ -221,23 +221,29 @@ void report(const char* what, const Run& r) {
     std::printf("%-9s median %7.1f us  p99 %7.1f us  max %7.1f us  (%.1f%% of a %.0f us block, median)  rms %.4f peak %.3f\n",
                 what, med, p99, us.back(), 100 * med / budget, budget, std::sqrt(sum / r.l.size()), peak);
 }
-// Parameters and state: find a parameter that reads back what was set (readouts do not), set it, save the chunk, change it,
-// restore the chunk, and expect the first value back.
+// Parameters and state: take up to 8 parameters that read back what was set (readouts do not), set them to 0.25, save the chunk,
+// set them to 0.75, restore the chunk, and expect each parameter to read what it read before the save.
 bool state_check(const char* what, Plugin& p) {
-    int idx = -1;
-    for (int i = 0; i < p.num_params() && idx < 0; i++) { p.set_param(i, 0.25f); if (std::fabs(p.get_param(i) - 0.25f) < 0.02f) idx = i; }
-    if (idx < 0) { std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
-    p.set_param(idx, 0.25f);
-    const float a = p.get_param(idx);
+    std::vector<int> idx; std::vector<float> saved;
+    for (int i = 0; i < p.num_params() && idx.size() < 8; i++) {
+        p.set_param(i, 0.25f); const float v = p.get_param(i);
+        p.set_param(i, 0.75f); const float w = p.get_param(i);
+        if (std::fabs(v - 0.25f) < 0.15f && std::fabs(w - 0.75f) < 0.15f && w > v) idx.push_back(i);   // quantised parameters round
+    }
+    if (idx.empty()) { std::printf("%-9s state: no settable parameter among %d\n", what, p.num_params()); return true; }
+    for (int i : idx) { p.set_param(i, 0.25f); saved.push_back(p.get_param(i)); }
     const auto chunk = p.get_chunk();
-    p.set_param(idx, 0.75f);
-    const float b = p.get_param(idx);
-    const bool set_ok = std::fabs(a - 0.25f) < 0.02f && std::fabs(b - 0.75f) < 0.02f;
-    if (chunk.empty()) { std::printf("%-9s state: param %d %.3f -> %.3f (%s), no chunk\n", what, idx, a, b, set_ok ? "ok" : "FAILED"); return set_ok; }
+    for (int i : idx) p.set_param(i, 0.75f);
+    if (chunk.empty()) { std::printf("%-9s state: %zu settable parameters, no chunk (ok)\n", what, idx.size()); return true; }
     const bool restored = p.set_chunk(chunk);
-    const float c = p.get_param(idx);
-    const bool ok = set_ok && restored && std::fabs(c - a) < 0.02f;
-    std::printf("%-9s state: param %d %.3f -> %.3f, chunk %zu bytes, restored %.3f (%s)\n", what, idx, a, b, chunk.size(), c, ok ? "ok" : "FAILED");
+    std::string bad; int good = 0;
+    for (size_t k = 0; k < idx.size(); k++) {
+        const float c = p.get_param(idx[k]);
+        if (std::fabs(c - saved[k]) < 0.005f) good++; else { char t[64]; std::snprintf(t, sizeof t, " %d:%.3f->%.3f", idx[k], saved[k], c); bad += t; }
+    }
+    const bool ok = restored && bad.empty();
+    if (!ok && std::getenv("MPC_HOST_DUMP")) { const auto after = p.get_chunk(); std::printf("chunk before: %.*s\nchunk after:  %.*s\n", (int)std::min<size_t>(chunk.size(), 300), (const char*)chunk.data(), (int)std::min<size_t>(after.size(), 300), (const char*)after.data()); }
+    std::printf("%-9s state: %d/%zu parameters restored from a %zu-byte chunk (%s)%s\n", what, good, idx.size(), chunk.size(), ok ? "ok" : "FAILED", bad.c_str());
     return ok;
 }
 }  // namespace

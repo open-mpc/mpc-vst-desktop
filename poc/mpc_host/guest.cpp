@@ -197,7 +197,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
         return out;
     }
 
-    // sscanf: %d %i %u %x %o %f %g %e %s %c %n %% and literals, the l modifier, and * to skip. Field widths are ignored.
+    // sscanf: %d %i %u %x %o %f %g %e %s %c %n %% and literals, the l modifier, and * to skip. Field widths limit the input read.
     // Returns the number of stores, or -1 (EOF) if the input ends before the first conversion.
     int scan(const char* in, const char* f, VarArgs va) {
         int n = 0; const char* s = in;
@@ -207,28 +207,33 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks {
             f++;
             if (*f == '%') { if (*s != '%') return n; s++; f++; continue; }
             bool skip = false; if (*f == '*') { skip = true; f++; }
-            while (std::isdigit((unsigned char)*f)) f++;
+            uint32_t width = 0;
+            while (std::isdigit((unsigned char)*f)) width = width * 10 + (uint32_t)(*f++ - '0');
             int lng = 0;
             while (*f && std::strchr("hlLzjt", *f)) { if (*f == 'l') lng++; f++; }
             const char c = *f++;
             if (c == 'n') { if (!skip) wr<uint32_t>(va.next32(), (uint32_t)(s - in)); continue; }
             if (c != 'c') while (std::isspace((unsigned char)*s)) s++;
             if (!*s) return n ? n : -1;
+            char field[128];   // the input limited to the field width, for the numeric conversions
+            if (c != 'c' && c != 's') { std::strncpy(field, s, width && width < sizeof field ? width : sizeof field - 1); field[width && width < sizeof field ? width : sizeof field - 1] = 0; }
             char* e = const_cast<char*>(s);
             switch (c) {
             case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
                 const int base = c == 'x' || c == 'X' ? 16 : c == 'o' ? 8 : c == 'i' ? 0 : 10;
-                const long v = (c == 'u' || base == 16 || base == 8) ? (long)std::strtoul(s, &e, base) : std::strtol(s, &e, base);
-                if (e == s) return n;
+                const long v = (c == 'u' || base == 16 || base == 8) ? (long)std::strtoul(field, &e, base) : std::strtol(field, &e, base);
+                if (e == field) return n;
+                e = const_cast<char*>(s) + (e - field);
                 if (!skip) wr<uint32_t>(va.next32(), (uint32_t)v);
                 break; }
             case 'f': case 'g': case 'e': case 'a': case 'E': case 'G': {
-                const double v = std::strtod(s, &e);
-                if (e == s) return n;
+                const double v = std::strtod(field, &e);
+                if (e == field) return n;
+                e = const_cast<char*>(s) + (e - field);
                 if (!skip) { const gaddr p = va.next32(); if (lng) std::memcpy(m + p, &v, 8); else { const float fv = (float)v; std::memcpy(m + p, &fv, 4); } }
                 break; }
             case 's': {
-                while (*e && !std::isspace((unsigned char)*e)) e++;
+                while (*e && !std::isspace((unsigned char)*e) && (!width || (uint32_t)(e - s) < width)) e++;
                 if (!skip) { const gaddr p = va.next32(); std::memcpy(m + p, s, (size_t)(e - s)); m[p + (e - s)] = 0; }
                 break; }
             case 'c':
@@ -443,6 +448,34 @@ std::vector<Entry> libc_table() {
     add("rand", [](I& i) { i.ret((uint32_t)std::rand()); });
     add("srand", [](I& i) { std::srand(i.r(0)); });
     add("time", [](I& i) { const uint32_t t = (uint32_t)std::time(nullptr); if (i.r(0)) i.wr<uint32_t>(i.r(0), t); i.ret(t); });
+    // single-import stoppers found by the survey: calls that can fail or do nothing for a sandboxed guest
+    add("frexpf", [](I& i) { int e; const float v = std::frexp(i.s(0), &e); i.wr<int32_t>(i.r(0), e); i.ret_f(v); });
+    add("fma", [](I& i) { i.ret_d(std::fma(i.d(0), i.d(1), i.d(2))); });
+    add("fmaf", [](I& i) { i.ret_f(std::fma(i.s(0), i.s(1), i.s(2))); });
+    add("localtime", [](I& i) { i.ret(0); });   // callers log timestamps: a NULL result is allowed by the C standard
+    for (const char* n : {"dlopen", "dlsym", "dladdr", "dlerror"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"sigaction", "pthread_attr_init", "pthread_attr_destroy", "pthread_attr_setschedpolicy", "pthread_attr_setschedparam",
+                          "pthread_attr_setinheritsched", "pthread_setname_np", "pthread_setaffinity_np", "sched_setaffinity", "pthread_setschedparam"})
+        add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"__xstat", "__lxstat", "__fxstat", "stat", "getrlimit", "snd_seq_open"}) add(n, [](I& i) { i.ret(0xFFFFFFFFu); });
+    add("strtok_r", [](I& i) {
+        gaddr p = i.r(0) ? i.r(0) : i.rd<uint32_t>(i.r(2));
+        const char* delim = i.str(i.r(1));
+        if (!p) { i.ret(0); return; }
+        while (i.m[p] && std::strchr(delim, i.m[p])) p++;
+        if (!i.m[p]) { i.wr<uint32_t>(i.r(2), p); i.ret(0); return; }
+        const gaddr tok = p;
+        while (i.m[p] && !std::strchr(delim, i.m[p])) p++;
+        if (i.m[p]) { i.m[p] = 0; p++; }
+        i.wr<uint32_t>(i.r(2), p);
+        i.ret(tok); });
+    add("strftime", [](I& i) { if (i.r(1)) i.m[i.r(0)] = 0; i.ret(0); });   // no clock formatting: an empty string
+    add("glob", [](I& i) { i.ret(3); });                                      // GLOB_NOMATCH
+    add("globfree", [](I& i) { i.ret(0); });
+    for (const char* n : {"setrlimit", "pthread_attr_setstacksize", "pthread_attr_setdetachstate"}) add(n, [](I& i) { i.ret(0); });
+    add("aligned_alloc", [](I& i) { const gaddr p = i.malloc_(i.r(1) + i.r(0)); i.ret((p + i.r(0) - 1) & ~(i.r(0) - 1)); });
+    add("setenv", [](I& i) { i.ret(0); });
+    add("pthread_self", [](I& i) { i.ret(1); });
     add("__aeabi_read_tp", [](I& i) { i.ret(kTp); });
     add("__tls_get_addr", [](I& i) { const gaddr ti = i.r(0); i.ret(i.tls.at(i.rd<uint32_t>(ti) - 1).block + i.rd<uint32_t>(ti + 4)); });
     // C++ runtime

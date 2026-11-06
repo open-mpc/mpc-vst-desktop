@@ -139,8 +139,8 @@ The driver calls `setParameter`/`getParameter` (AEffect bytes 12 and 16, floats 
 finds a parameter that reads back what was set (readouts do not), saves the chunk, changes the parameter, restores the chunk and
 expects the first value; the exit code is 1 if that fails. `poc/mpc_host/statetest/` is a small engine fixture for it (two parameters
 and a `state` string). Checked 2026-11-06, offline: the emulated armv7 build and a native x86 build of the fixture both print
-`param 0 0.250 -> 0.750, chunk 18 bytes, restored 0.250 (ok)`. The fixture's `sscanf` found a missing import, so the host now
-thunks `sscanf` (`%d %i %u %x %o %f %g %s %c %n %%`, `l`, `*`; widths ignored). The songpos and uiprobe probes have no settable
+`2/2 parameters restored from a 18-byte chunk (ok)`. The fixture's `sscanf` found a missing import, so the host now
+thunks `sscanf` (`%d %i %u %x %o %f %g %s %c %n %%`, `l`, `*`; field widths). The songpos and uiprobe probes have no settable
 parameter and report that. Not checked: a real port's chunk (Acid-303 and the others live in their own repos), threads.
 
 ## Survey of local builds (2026-11-06, offline)
@@ -173,13 +173,18 @@ in guest memory (so the init routine runs without a nested call from a thunk, wh
 set of locale and wide-character thunks, pthread keys, mutex/condition no-ops, `vsnprintf`, `errno`, and failing file and directory calls.
 `MPC_HOST_LAX=1` logs an unsupported import once and returns 0, to list what a plugin really calls.
 
-Re-run of the survey with `MPC_HOST_LIBS` set (same 34 files), parameter and chunk check:
+Re-run of the survey with `MPC_HOST_LIBS` set (same 34 files; the check now sets up to 8 parameters, saves the chunk, changes them,
+restores, and compares each with its own saved value):
 
 | Result | Plugins |
 |---|---|
-| Runs; round-trip ok | Dexed DX7 (2285 B chunk, C++ and `std::string`), jn106 (512 B), profit5 (186 B), trcw78 (330 B), model303 and acid303 (301 B); OTT and both Reverbicon builds set parameters but have no chunk |
-| Runs; chunk restore wrong (param 0 reads 1.000) | morpho_pe, clementine_xt: same symptom, both on parameter 0; not yet compared with a native build |
-| Stops on one import | `frexpf`, `fma` (8 airwin2rack), `localtime` (machinedrum_one, monomodule), `dlopen`/`dladdr` (machinedrum tap, clementine), `sigaction` (cratedigger), `__xstat` (lucky dip), `getrlimit` (MM-303), `pthread_attr_init` (model72), `snd_seq_open` (maze, ALSA), `pthread_create` (jv880), `abort` (rhythmbank) |
+| Runs; all checked parameters restored from the chunk | Dexed DX7 (2289 B), jn106, profit5, trcw78 (2 files), model303 and acid303, morpho_pe, clementine and clementine_xt, maze combo and sequencer, the 8 airwin2rack plugins, monomodule_fx. OTT and both Reverbicon builds have settable parameters and no chunk |
+| Runs, but not meaningful | machinedrum_one and MM-303 start a worker thread (`pthread_create` is stubbed in `MPC_HOST_LAX` mode) and restore 0/8; machinedrum tap and tapfx have no settable parameter |
+| Stops | jv880, lucky dip, model72: `pthread_create`. cratedigger (2 files): `VSTPluginMain` returns no `AEffect`. rhythmbank: calls `abort` (cause not looked at) |
+
+A first run of this table showed clementine and morpho_pe restoring every parameter to 1.000. That was the host: `sscanf` ignored field
+widths, so a hex chunk read with `%2x` parsed as one number. Widths are implemented now and both restore correctly. The lesson for the next
+failure: a state bug that hits every parameter is probably a libc thunk, not the port.
 
 Dexed's C++ exceptions are not exercised yet: the unwinder needs `dl_iterate_phdr`, which calls back into guest code.
 
@@ -187,7 +192,7 @@ Dexed's C++ exceptions are not exercised yet: the unwinder needs `dl_iterate_phd
 
 1. Run the same survey on every catalog release (`catalog/plugins/*.json` repos, armv7 and aarch64 zips), from a session
    that can reach those repos, and list the union of imports and syscalls.
-2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Next: the simple missing imports, `dl_iterate_phdr` and exceptions, threads, the build on Windows (MSVC or mingw) and macOS
+2. Done for Acid-303 (see "Prototype"). Params and state chunks and guest libraries: done 2026-11-06 (offline, x86 Linux): see the two sections above. Next: threads (`pthread_create`), `dl_iterate_phdr` and exceptions, cratedigger and rhythmbank, the build on Windows (MSVC or mingw) and macOS
    (arm64 host: dynarmic's arm64 back end).
 3. Then the helper process with shared-memory transport, the VST3 shell, the Windows/macOS builds and the editor windows.
 
