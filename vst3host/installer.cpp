@@ -366,6 +366,30 @@ bool load_catalog(const std::string& url, const std::string& arch, std::vector<I
     return true;
 }
 
+bool parse_qlinks(const std::string& path, std::vector<QPage>& pages) {
+    std::vector<uint8_t> buf; std::string err;
+    pages.clear();
+    if (!http_get(path, buf, err)) return false;
+    J root; P ps{(const char*)buf.data(), (const char*)buf.data() + buf.size()};
+    if (!ps.val(root) || root.t != J::Obj) return false;
+    const J* sm = root.get("Screen Mode Q-Links");
+    const J* map = sm ? sm->get("map") : nullptr;
+    if (!map || map->t != J::Arr) return false;
+    for (const J& e : map->a) {
+        QPage q;
+        for (int i = 0; i <= 16; i++) q.map[i] = -1;
+        const J* t = e.get("Tab"); const J* st = e.get("SubTab");
+        q.tab = t ? (int)t->n : 0; q.sub = st ? (int)st->n : 0;
+        q.column = e.str("Bank Direction") != "Row";
+        if (const J* ql = e.get("Q-Links")) for (auto& kv : ql->o) {
+            int n = 0;
+            if (sscanf(kv.first.c_str(), "Q-Link %d", &n) == 1 && n >= 1 && n <= 16 && kv.second.t == J::Num) q.map[n] = (int)kv.second.n;
+        }
+        pages.push_back(q);
+    }
+    return !pages.empty();
+}
+
 bool install(const Item& it, const std::string& root, std::string& folder, std::string& err) {
     std::vector<uint8_t> zip;
     if (!http_get(it.url, zip, err)) return false;

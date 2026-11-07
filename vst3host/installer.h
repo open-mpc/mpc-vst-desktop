@@ -21,4 +21,8 @@ bool load_catalog(const std::string& url, const std::string& arch, std::vector<I
 // Download, verify, unpack and install: <root>/sdcard/Synths/<folder>/ (the package's portable/<folder>, as install.sh copies it). Returns the folder name.
 bool install(const Item& it, const std::string& root, std::string& folder, std::string& err);
 
+// A skin's Q-Links.json: per page (Tab, SubTab) which hosted parameter each of the 16 Q-Link keys (numbered 1..16, bottom row first) drives; -1 for none.
+struct QPage { int tab = 0, sub = 0; bool column = true; int map[17]; };
+bool parse_qlinks(const std::string& path, std::vector<QPage>& pages);
+
 }  // namespace pm

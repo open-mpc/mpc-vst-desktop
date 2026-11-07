@@ -24,6 +24,7 @@
 #include "../mpc-vst-plugins/wrapper/vst3_abi.h"
 #include "../mpc-vst-plugins/wrapper/resample.h"
 #include "../poc/mpc_host/hosted.h"
+#include "installer.h"
 
 using mpchost::HostedPlugin;
 
@@ -31,7 +32,7 @@ using mpchost::HostedPlugin;
 enum : uint32_t {
     kQLink1 = 1,          // 1..8
     kQBank = 9, kQNext = 10, kQMode = 11,
-    kBypass = 12, kPlugin = 13,   // Plugin: the hosted plugin, as a list
+    kBypass = 12, kPlugin = 13, kPage = 14,   // Plugin: the hosted plugin, as a list
     kPluginBase = 100,
     kMidiBase = 100000,   // + channel*130 + controller (0..127 CC, 128 channel pressure, 129 pitch bend): hidden, for IMidiMapping    // 100 + hosted parameter index
 };
@@ -121,6 +122,7 @@ struct Host {
     IComponentHandler* handler = nullptr;
     int nparams = 0;
     std::vector<float> pv;            // the host's view of each hosted parameter
+    std::vector<pm::QPage> pages; int qpage = 0;   // the skin's Q-Link sets
     int qmode = 4, qbank = 0;         // Q-Link section: 4 or 8 knobs, and the bank shown
     double qval[8] = {};              // the knobs' own normalised values (what the host sees)
     double rate = 44100;
@@ -133,9 +135,23 @@ struct Host {
 };
 #define FROM(p, m) ((Host*)((char*)(p) - offsetof(Host, m)))
 
-static int nbanks(Host* h) { int n = (h->nparams + h->qmode - 1) / h->qmode; return n < 1 ? 1 : n > 16 ? 16 : n; }
-// Fallback Q-Link map (until the skin's Q-Link sets are read): knob n of bank b drives hosted parameter b*mode+n.
-static int qparam(Host* h, int knob) { int p = h->qbank * h->qmode + knob; return p < h->nparams ? p : -1; }
+static int nbanks(Host* h) {
+    if (!h->pages.empty()) return 16 / h->qmode;   // 4 knobs: a bank is one column of the 4x4 grid (4 banks), 8 knobs: two columns (2 banks)
+    int n = (h->nparams + h->qmode - 1) / h->qmode; return n < 1 ? 1 : n > 16 ? 16 : n;
+}
+// Which hosted parameter knob `knob` drives. With the skin's Q-Link set for the current page: Q-Links are numbered 1..16 from the bottom row, bank 1 of a
+// "Column" page is 13,9,5,1 (then 14,10,6,2 for 8 knobs), each next bank moves right. Without a skin: parameter bank*mode+knob.
+static int qparam(Host* h, int knob) {
+    if (!h->pages.empty()) {
+        const pm::QPage& pg = h->pages[h->qpage % h->pages.size()];
+        int ncols = h->qmode / 4, q;
+        if (pg.column) q = 13 + h->qbank * ncols + knob / 4 - 4 * (knob % 4);
+        else q = 13 - 4 * (h->qbank * ncols + knob / 4) + knob % 4;
+        int p = q >= 1 && q <= 16 ? pg.map[q] : -1;
+        return p >= 0 && p < h->nparams ? p : -1;
+    }
+    int p = h->qbank * h->qmode + knob; return p < h->nparams ? p : -1;
+}
 static void qrefresh(Host* h) {   // knobs show their parameter's value after a bank or mode change
     for (int k = 0; k < 8; k++) { int p = k < h->qmode ? qparam(h, k) : -1; h->qval[k] = p >= 0 ? h->pv[p] : 0; }
 }
@@ -147,7 +163,7 @@ static void set_hosted(Host* h, int p, double v) {   // callers hold mu
 }
 
 static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the hosted plugin
-    delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
+    h->pages.clear(); delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
     qrefresh(h);
     if (idx < 0 || idx >= (int)h->entries.size()) return false;
     const std::string so = h->entries[idx].so;
@@ -161,7 +177,13 @@ static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the ho
     h->nparams = hp->num_params();
     h->pv.assign(h->nparams, 0);
     for (int i = 0; i < h->nparams; i++) h->pv[i] = hp->get_param(i);
-    h->qbank = 0;
+    h->qbank = 0; h->qpage = 0;
+    {
+        std::string dir = so.substr(0, so.find_last_of('/') == std::string::npos ? 0 : so.find_last_of('/'));
+        std::string f8 = dir + "/Plugin Skins/Q-Links - 8by1.json", f4 = dir + "/Plugin Skins/Q-Links.json";
+        h->pages.clear();
+        if (!(h->qmode == 8 && has(f8) && pm::parse_qlinks(f8, h->pages))) pm::parse_qlinks(f4, h->pages);
+    }
     qrefresh(h);
     return true;
 }
@@ -255,9 +277,9 @@ static tresult comp_get_state(void* s, IBStream* st) {
     std::lock_guard<std::mutex> l(h->mu);
     std::vector<uint8_t> chunk = h->hp ? h->hp->get_chunk() : std::vector<uint8_t>();
     uint32_t magic = 0x3248504f /* "OPH2" */, n = (uint32_t)chunk.size(), np = (uint32_t)h->pv.size();
-    uint8_t q[2] = {(uint8_t)h->qmode, (uint8_t)h->qbank};
+    uint8_t q[3] = {(uint8_t)h->qmode, (uint8_t)h->qbank, (uint8_t)h->qpage};
     uint16_t nl = (uint16_t)(h->cur >= 0 ? h->entries[h->cur].name.size() : 0);
-    put(st, &magic, 4); put(st, &nl, 2); if (nl) put(st, h->entries[h->cur].name.data(), nl); put(st, q, 2); put(st, &n, 4); if (n) put(st, chunk.data(), (int)n);
+    put(st, &magic, 4); put(st, &nl, 2); if (nl) put(st, h->entries[h->cur].name.data(), nl); put(st, q, 3); put(st, &n, 4); if (n) put(st, chunk.data(), (int)n);
     put(st, &np, 4); if (np) put(st, h->pv.data(), (int)(np * 4));
     return kResultOk;
 }
@@ -265,16 +287,16 @@ static tresult comp_set_state(void* s, IBStream* st) {
     Host* h = FROM(s, comp);
     std::lock_guard<std::mutex> l(h->mu);
     uint32_t magic = 0, n = 0, np = 0;
-    uint8_t q[2];
+    uint8_t q[3];
     uint16_t nl = 0;
     if (!get(st, &magic, 4) || magic != 0x3248504f || !get(st, &nl, 2)) return kResultFalse;
     std::string pname(nl, 0);
     if (nl && !get(st, &pname[0], nl)) return kResultFalse;
     if (!h->switching && (h->cur < 0 || h->entries[h->cur].name != pname)) { for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == pname) { load_index(h, i); break; } }
-    if (!get(st, q, 2) || !get(st, &n, 4) || n > (64u << 20)) return kResultFalse;
+    if (!get(st, q, 3) || !get(st, &n, 4) || n > (64u << 20)) return kResultFalse;
     std::vector<uint8_t> chunk(n);
     if (n && !get(st, chunk.data(), (int)n)) return kResultFalse;
-    h->qmode = q[0] == 8 ? 8 : 4; h->qbank = q[1];
+    h->qmode = q[0] == 8 ? 8 : 4; h->qbank = q[1]; h->qpage = q[2];
     if (h->hp && n) {
         h->hp->set_chunk(chunk);
         for (int i = 0; i < h->nparams; i++) h->pv[i] = h->hp->get_param(i);
@@ -283,6 +305,7 @@ static tresult comp_set_state(void* s, IBStream* st) {
         if (np && get(st, v.data(), (int)(np * 4))) for (uint32_t i = 0; i < np && (int)i < h->nparams; i++) set_hosted(h, (int)i, v[i]);
     }
     if (h->qbank >= nbanks(h)) h->qbank = 0;
+    if (h->qpage >= (int)h->pages.size()) h->qpage = 0;
     qrefresh(h);
     return kResultOk;
 }
@@ -325,6 +348,9 @@ static void apply_param_change(Host* h, uint32_t id, double v) {   // mu held
     } else if (id == kPlugin) {
         int n = (int)h->entries.size();
         if (n > 1) request_switch(h, (int)lround(v * (n - 1)));
+    } else if (id == kPage) {
+        int n = (int)h->pages.size();
+        if (n > 1) { h->qpage = (int)lround(v * (n - 1)); h->qbank = 0; qrefresh(h); }
     } else if (id == kBypass) {
         h->bypass = v > 0.5;
     } else if (id >= kMidiBase) {
@@ -435,12 +461,12 @@ static tresult ctrl_set_comp_state(void*, IBStream*) { return kResultOk; }   // 
 static tresult ctrl_set_state(void*, IBStream*) { return kResultOk; }
 static tresult ctrl_get_state(void*, IBStream*) { return kResultOk; }
 // Parameters: Q-Link 1..8, Q-Link Bank, Next Bank, Q-Link Mode, then every parameter of the hosted plugin.
-static int32_t ctrl_count(void* s) { Host* h = FROM(s, ctrl); std::lock_guard<std::mutex> l(h->mu); return 13 + h->nparams + 16 * 130; }
-static uint32_t id_at(int i, int np) { return i < 8 ? kQLink1 + i : i < 11 ? kQBank + (i - 8) : i == 11 ? kBypass : i == 12 ? kPlugin : i < 13 + np ? kPluginBase + (i - 13) : kMidiBase + (i - 13 - np); }
+static int32_t ctrl_count(void* s) { Host* h = FROM(s, ctrl); std::lock_guard<std::mutex> l(h->mu); return 14 + h->nparams + 16 * 130; }
+static uint32_t id_at(int i, int np) { return i < 8 ? kQLink1 + i : i < 11 ? kQBank + (i - 8) : i == 11 ? kBypass : i == 12 ? kPlugin : i == 13 ? kPage : i < 14 + np ? kPluginBase + (i - 14) : kMidiBase + (i - 14 - np); }
 static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
     Host* h = FROM(s, ctrl);
     std::lock_guard<std::mutex> l(h->mu);
-    if (i < 0 || i >= 13 + h->nparams + 16 * 130) return kInvalidArgument;
+    if (i < 0 || i >= 14 + h->nparams + 16 * 130) return kInvalidArgument;
     memset(pi, 0, sizeof *pi);
     pi->id = id_at(i, h->nparams);
     if (pi->id >= kMidiBase) {
@@ -460,6 +486,11 @@ static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
         pi->defaultNormalizedValue = 0;
         return kResultOk;
     }
+    if (pi->id == kPage) {
+        to16(pi->title, "Q-Link Page"); to16(pi->shortTitle, "Page");
+        pi->stepCount = h->pages.size() > 1 ? (int)h->pages.size() - 1 : 1; pi->flags = kCanAutomate | kIsList;
+        return kResultOk;
+    }
     if (pi->id == kBypass) { to16(pi->title, "Bypass"); to16(pi->shortTitle, "Bypass"); pi->stepCount = 1; pi->flags = kCanAutomate | kIsBypass; return kResultOk; }
     std::string t;
     if (i < 8) { t = "Q-Link " + std::to_string(i + 1); pi->flags = kCanAutomate; }
@@ -467,7 +498,7 @@ static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
     else if (pi->id == kQNext) { t = "Q-Link Next Bank"; pi->stepCount = 1; pi->flags = kCanAutomate; }
     else if (pi->id == kQMode) { t = "Q-Link Mode (4/8)"; pi->stepCount = 1; pi->flags = kCanAutomate | kIsList; }
     else {
-        int p = i - 13;
+        int p = i - 14;
         t = h->hp ? h->hp->param_name(p) : "Param";
         if (t.empty()) t = "Param " + std::to_string(p + 1);
         pi->defaultNormalizedValue = h->pv[p];
@@ -485,6 +516,7 @@ static double ctrl_get(void* s, uint32_t id) {
     if (id == kQBank) return h->qbank / 15.0;
     if (id == kQNext) return 0;
     if (id == kBypass) return h->bypass;
+    if (id == kPage) return h->pages.size() > 1 ? h->qpage / (double)(h->pages.size() - 1) : 0;
     if (id == kPlugin) return h->entries.size() > 1 && h->cur >= 0 ? h->cur / (double)(h->entries.size() - 1) : 0;
     if (id >= kMidiBase) return (id - kMidiBase) % 130 == 129 ? 0.5 : 0;
     if (id == kQMode) return h->qmode == 8 ? 1 : 0;
@@ -502,7 +534,8 @@ static tresult ctrl_str(void* s, uint32_t id, double v, char16* out) {
     Host* h = FROM(s, ctrl);
     std::lock_guard<std::mutex> l(h->mu);
     char b[64];
-    if (id == kPlugin) { int n = (int)h->entries.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "%s", k < n ? h->entries[k].name.c_str() : "-"); }
+    if (id == kPage) { int n = (int)h->pages.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "Tab %d.%d", n ? h->pages[k].tab : 0, n ? h->pages[k].sub : 0); }
+    else if (id == kPlugin) { int n = (int)h->entries.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "%s", k < n ? h->entries[k].name.c_str() : "-"); }
     else if (id == kQBank) snprintf(b, sizeof b, "Bank %d", (int)lround(v * 15) + 1);
     else if (id == kQMode) snprintf(b, sizeof b, "%s", v > 0.5 ? "8 knobs" : "4 knobs");
     else if (id == kQNext) snprintf(b, sizeof b, "%s", v > 0.5 ? "Next" : "-");

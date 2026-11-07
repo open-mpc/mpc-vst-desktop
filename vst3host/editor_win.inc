@@ -4,7 +4,7 @@
 // Immediate mode: paint() records the clickable rectangles, the mouse handlers look them up. The skin view of the hosted plugin comes later (M4b).
 #include "installer.h"
 
-enum HitKind { H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
+enum HitKind { H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_PAGEPREV, H_PAGENEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
 struct Hit { RECT r; int kind, arg; };
 struct View {
     const PlugViewVtbl* vt; uint32_t refs = 1;
@@ -121,9 +121,15 @@ static void paint(View* v, HDC dc, RECT cr) {
             text("Bank " + std::to_string(h->qbank + 1) + " / " + std::to_string(nbanks(h)), RECT{386, 108, 466, 134}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             button(RECT{470, 108, 500, 134}, ">", H_BANKNEXT, 0);
             button(RECT{512, 108, 612, 134}, "Next bank", H_NEXT, 0);
+            if (!h->pages.empty()) {
+                button(RECT{262, 140, 292, 166}, "<", H_PAGEPREV, 0);
+                const pm::QPage& pg = h->pages[h->qpage % h->pages.size()];
+                text("Page " + std::to_string(h->qpage + 1) + " / " + std::to_string(h->pages.size()) + "   (skin tab " + std::to_string(pg.tab) + "." + std::to_string(pg.sub) + ")", RECT{296, 140, 520, 166}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                button(RECT{524, 140, 554, 166}, ">", H_PAGENEXT, 0);
+            }
             int per = h->qmode == 8 ? 4 : 4, rows = h->qmode == 8 ? 2 : 1, kw = (VW - 16 - 250 - 24) / per;
             for (int k = 0; k < h->qmode; k++) {
-                int cx = 262 + (k % per) * kw + kw / 2, cy = 190 + (k / per) * 120, r = 30;
+                int cx = 262 + (k % per) * kw + kw / 2, cy = 222 + (k / per) * 108, r = 30;
                 RECT kr{cx - kw / 2 + 4, cy - 44, cx + kw / 2 - 4, cy + 62};
                 v->hits.push_back({kr, H_KNOB, k});
                 HPEN pen = CreatePen(PS_SOLID, 3, RGB(70, 75, 88)); HGDIOBJ op = SelectObject(m, pen); HGDIOBJ ob = SelectObject(m, GetStockObject(NULL_BRUSH));
@@ -178,6 +184,11 @@ static void click(View* v, int x, int y) {
             case H_BANKPREV: case H_BANKNEXT: {
                 int nb = nbanks(h), b = (h->qbank + (ht.kind == H_BANKNEXT ? 1 : nb - 1)) % nb;
                 ui_edit(v, kQBank, b / 15.0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kQBank);
+                break;
+            }
+            case H_PAGEPREV: case H_PAGENEXT: {
+                int np = (int)h->pages.size(), pg = (h->qpage + (ht.kind == H_PAGENEXT ? 1 : np - 1)) % (np ? np : 1);
+                ui_edit(v, kPage, np > 1 ? pg / (double)(np - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kPage);
                 break;
             }
             case H_NEXT: ui_edit(v, kQNext, 1, 0); ui_edit(v, kQNext, 0, 2); break;
