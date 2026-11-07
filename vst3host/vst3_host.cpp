@@ -449,7 +449,7 @@ static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
     if (pi->id == kPlugin) {
         to16(pi->title, "Plugin"); to16(pi->shortTitle, "Plugin");
         int n = (int)h->entries.size();
-        pi->stepCount = n > 1 ? n - 1 : 1; pi->flags = kCanAutomate | kIsList | kIsProgramChange;
+        pi->stepCount = n > 1 ? n - 1 : 1; pi->flags = kCanAutomate | kIsList;
         pi->defaultNormalizedValue = 0;
         return kResultOk;
     }
