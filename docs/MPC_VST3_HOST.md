@@ -93,7 +93,9 @@ Still to decide (see below): which hosts the curl shim may reach, and whether sw
 
 **M3 service done (2026-11-07, offline plus the live catalog, Linux):** `vst3host/installer.{h,cpp}` is the host-native manager: catalog.json (open-mpc.github.io), download (libcurl on Linux, WinHTTP on Windows), sha256, unzip with its own inflate, install of the package's `portable/<folder>` into `<root>/sdcard/Synths/<folder>/` (files the user added stay). `vst3host/pm_cli.cpp` drives it: `pm_cli list [filter]`, `pm_cli install <id> <root>`; installing the real Plugin Manager G2 0.2.5 from GitHub worked (sha256 verified, 2487 files, the .so is there). Not yet: wiring into the module and the editor's manager panel (M4); the Windows build of pm_cli is compiled, the run is pending.
 
-**Not started:** M4 (editor, manager panel), M5.
+**M4a done (2026-11-07, offline, native Windows 11):** a Win32/GDI editor (`vst3host/editor_win.inc`, 720x420, IPlugView `HWND`): a Plugin tab (the plugins on offer, click to switch; the Q-Link section: 4 or 8 knobs you drag, Mode, Bank < >, Next bank; knob labels and values are the hosted plugin's own parameters) and a Manager tab (Refresh reads the live catalog, 207 plugins; Install downloads, verifies, installs and switches to it). `vst3host/view_test.c` opens it in a window and saves screenshots; the Plugin Manager's real Q-Links (View, Filter, Sort, Dropdown) show. Install from the editor itself was not clicked yet (the service was, via pm_cli). Not yet: the hosted plugin's skin in the editor (M4b), keyboard, DPI scaling, the Linux editor.
+
+**Not started:** M4b (skin view), M5 (Q-Link sets from skins), M6.
 
 **Where M1 began (done):**
 1. Create `vst3host/` with `vst3_host.cpp` (hand-written ABI: reuse `mpc-vst-plugins/wrapper/vst3_abi.h` and `resample.h`; model the factory and object layout on `mpc-vst-plugins/wrapper/vst3_wrap.c`), linking `guest.cpp hosted.cpp` and dynarmic from `poc/mpc_host/build*/` (see `build.sh` / `build_windows.sh` for flags).

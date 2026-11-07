@@ -12,6 +12,6 @@ BUNDLE=$HERE/build-win/OpenMPC\ Host.vst3
 mkdir -p "$BUNDLE/Contents/x86_64-win" "$BUNDLE/Contents/Resources/plugins"
 LIBS=$(find "$WB/dynarmic" -name '*.a' | grep -v libdynarmic.a | tr '\n' ' ')
 $CXX -std=c++20 -O2 -g -Wall -Wno-reorder -shared -static -Wl,--kill-at -I"$DYN/src" -I"$DYN/externals/mcl/include" -I"${BOOST_INCLUDEDIR:-/usr/include}" \
-    "$HERE/vst3_host.cpp" "$MH/guest.cpp" "$MH/hosted.cpp" "$WB/dynarmic/src/dynarmic/libdynarmic.a" $LIBS $LIBS -o "$BUNDLE/Contents/x86_64-win/OpenMPC Host.vst3"
+    "$HERE/vst3_host.cpp" "$HERE/installer.cpp" "$MH/guest.cpp" "$MH/hosted.cpp" "$WB/dynarmic/src/dynarmic/libdynarmic.a" $LIBS $LIBS -lwinhttp -lgdi32 -luser32 -o "$BUNDLE/Contents/x86_64-win/OpenMPC Host.vst3"
 for h in guest_helpers.so guest_helpers64.so; do [ -f "$WB/$h" ] && cp "$WB/$h" "$BUNDLE/Contents/Resources/"; done
 echo "built $BUNDLE"

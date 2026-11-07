@@ -519,7 +519,12 @@ static tresult ctrl_handler(void* s, IComponentHandler* hd) {
     if (hd) hd->v->addRef(hd);
     return kResultOk;
 }
-static void* ctrl_view(void*, const char*) { return nullptr; }   // M3: the skin editor
+#ifdef _WIN32
+#include "editor_win.inc"
+static void* ctrl_view(void* s, const char* name) { return name && !strcmp(name, "editor") ? create_view(FROM(s, ctrl)) : nullptr; }
+#else
+static void* ctrl_view(void*, const char*) { return nullptr; }   // the Linux editor comes later
+#endif
 static const ControllerVtbl ctrl_vtbl = {ctrl_query, ctrl_ref, ctrl_rel, ctrl_init, ctrl_term, ctrl_set_comp_state, ctrl_set_state, ctrl_get_state, ctrl_count, ctrl_info,
                                          ctrl_str, ctrl_val, ctrl_n2p, ctrl_p2n, ctrl_get, ctrl_set, ctrl_handler, ctrl_view};
 
