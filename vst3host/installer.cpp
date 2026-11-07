@@ -390,6 +390,23 @@ bool parse_qlinks(const std::string& path, std::vector<QPage>& pages) {
     return !pages.empty();
 }
 
+void name_pages(const std::string& path, std::vector<QPage>& pages) {
+    std::vector<uint8_t> buf; std::string err;
+    if (!http_get(path, buf, err)) return;
+    J root; P ps{(const char*)buf.data(), (const char*)buf.data() + buf.size()};
+    if (!ps.val(root)) return;
+    const J* pd = root.get("pageData"); const J* tabs = pd ? pd->get("tabs") : nullptr;
+    if (!tabs || tabs->t != J::Arr) return;
+    for (QPage& q : pages) {
+        int same = 0;
+        for (const J& t : tabs->a) { const J* k = t.get("fnKeyIndex"); if (k && (int)k->n == q.tab - 1) same++; }
+        for (const J& t : tabs->a) {
+            const J* k = t.get("fnKeyIndex"); const J* sk = t.get("fnKeySubIndex");
+            if (k && (int)k->n == q.tab - 1 && (sk ? (int)sk->n : 0) == q.sub - 1) { q.name = t.str("tabName"); if (same > 1) q.name += " " + std::to_string(q.sub); }
+        }
+    }
+}
+
 bool install(const Item& it, const std::string& root, std::string& folder, std::string& err) {
     std::vector<uint8_t> zip;
     if (!http_get(it.url, zip, err)) return false;

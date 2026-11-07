@@ -124,7 +124,7 @@ static void paint(View* v, HDC dc, RECT cr) {
             if (!h->pages.empty()) {
                 button(RECT{262, 140, 292, 166}, "<", H_PAGEPREV, 0);
                 const pm::QPage& pg = h->pages[h->qpage % h->pages.size()];
-                text("Page " + std::to_string(h->qpage + 1) + " / " + std::to_string(h->pages.size()) + "   (skin tab " + std::to_string(pg.tab) + "." + std::to_string(pg.sub) + ")", RECT{296, 140, 520, 166}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                text((pg.name.empty() ? "Page " + std::to_string(h->qpage + 1) : pg.name) + "   (" + std::to_string(h->qpage + 1) + " / " + std::to_string(h->pages.size()) + ")", RECT{296, 140, 520, 166}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 button(RECT{524, 140, 554, 166}, ">", H_PAGENEXT, 0);
             }
             int per = h->qmode == 8 ? 4 : 4, rows = h->qmode == 8 ? 2 : 1, kw = (VW - 16 - 250 - 24) / per;
@@ -201,7 +201,12 @@ static void click(View* v, int x, int y) {
     }
 }
 
-static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp);
+static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {   // an exception must not cross user32
+    try { return wndproc2(w, msg, wp, lp); } catch (const std::exception& e) { logf(std::string("editor: ") + e.what()); } catch (...) { logf("editor: exception"); }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     View* v = (View*)GetWindowLongPtrA(w, GWLP_USERDATA);
     if (!v) return DefWindowProcA(w, msg, wp, lp);
     switch (msg) {

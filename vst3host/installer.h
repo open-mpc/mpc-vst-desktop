@@ -22,7 +22,9 @@ bool load_catalog(const std::string& url, const std::string& arch, std::vector<I
 bool install(const Item& it, const std::string& root, std::string& folder, std::string& err);
 
 // A skin's Q-Links.json: per page (Tab, SubTab) which hosted parameter each of the 16 Q-Link keys (numbered 1..16, bottom row first) drives; -1 for none.
-struct QPage { int tab = 0, sub = 0; bool column = true; int map[17]; };
+struct QPage { int tab = 0, sub = 0; bool column = true; int map[17]; std::string name; };
 bool parse_qlinks(const std::string& path, std::vector<QPage>& pages);
+// Names the pages from the skin's TUI.json: Q-Links "Tab t, SubTab s" is the tab with fnKeyIndex t-1 and fnKeySubIndex s-1 (its tabName, e.g. "SEQ A").
+void name_pages(const std::string& tui_json, std::vector<QPage>& pages);
 
 }  // namespace pm

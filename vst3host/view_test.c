@@ -33,6 +33,10 @@ int main(int argc, char **argv) {
     char p[512];
     pump(800); snprintf(p, sizeof p, "%s-plugin.bmp", argv[2]); shot(GetWindow(w, GW_CHILD), p, r.right, r.bottom);
     HWND v = GetWindow(w, GW_CHILD);
+    SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(300, 120)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(300, 120)); pump(300);   /* Mode: 8 knobs */
+    snprintf(p, sizeof p, "%s-8.bmp", argv[2]); shot(v, p, r.right, r.bottom); printf("v=%p visible=%d\n", (void*)v, IsWindowVisible(v));
+    SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(540, 153)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(540, 153)); pump(1500);   /* next page */
+    printf("after page: visible=%d child=%p\n", IsWindowVisible(v), (void*)GetWindow(w, GW_CHILD)); snprintf(p, sizeof p, "%s-mode.bmp", argv[2]); shot(v, p, r.right, r.bottom);
     printf("click tab -> %lld\n", (long long)SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(480, 20))); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(480, 20)); pump(300);   /* Manager tab */
     SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(60, 60)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(60, 60));    /* Refresh */
     pump(6000); snprintf(p, sizeof p, "%s-manager.bmp", argv[2]); shot(v, p, r.right, r.bottom);

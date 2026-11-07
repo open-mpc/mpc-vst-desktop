@@ -122,6 +122,7 @@ struct Host {
     IComponentHandler* handler = nullptr;
     int nparams = 0;
     std::vector<float> pv;            // the host's view of each hosted parameter
+    std::string skin_dir;
     std::vector<pm::QPage> pages; int qpage = 0;   // the skin's Q-Link sets
     int qmode = 4, qbank = 0;         // Q-Link section: 4 or 8 knobs, and the bank shown
     double qval[8] = {};              // the knobs' own normalised values (what the host sees)
@@ -162,6 +163,15 @@ static void set_hosted(Host* h, int p, double v) {   // callers hold mu
     for (int k = 0; k < h->qmode; k++) if (qparam(h, k) == p) h->qval[k] = v;
 }
 
+static void reload_pages(Host* h, bool names = false) {   // the skin's Q-Link sets for the current mode (8 knobs: "Q-Links - 8by1.json" when the skin has one), named from TUI.json
+    std::string f8 = h->skin_dir + "/Q-Links - 8by1.json", f4 = h->skin_dir + "/Q-Links.json";
+    std::vector<pm::QPage> pg;
+    if (!(h->qmode == 8 && has(f8) && pm::parse_qlinks(f8, pg))) pm::parse_qlinks(f4, pg);
+    if (names) { if (!pg.empty()) pm::name_pages(h->skin_dir + "/TUI.json", pg); }   // TUI.json is large: read once per plugin
+    else for (auto& q : pg) for (auto& o : h->pages) if (o.tab == q.tab && o.sub == q.sub) q.name = o.name;
+    h->pages = pg;
+    if (h->qpage >= (int)h->pages.size()) h->qpage = 0;
+}
 static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the hosted plugin
     h->pages.clear(); delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
     qrefresh(h);
@@ -178,12 +188,8 @@ static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the ho
     h->pv.assign(h->nparams, 0);
     for (int i = 0; i < h->nparams; i++) h->pv[i] = hp->get_param(i);
     h->qbank = 0; h->qpage = 0;
-    {
-        std::string dir = so.substr(0, so.find_last_of('/') == std::string::npos ? 0 : so.find_last_of('/'));
-        std::string f8 = dir + "/Plugin Skins/Q-Links - 8by1.json", f4 = dir + "/Plugin Skins/Q-Links.json";
-        h->pages.clear();
-        if (!(h->qmode == 8 && has(f8) && pm::parse_qlinks(f8, h->pages))) pm::parse_qlinks(f4, h->pages);
-    }
+    h->skin_dir = so.substr(0, so.find_last_of('/') == std::string::npos ? 0 : so.find_last_of('/')) + "/Plugin Skins";
+    reload_pages(h, true);
     qrefresh(h);
     return true;
 }
@@ -305,7 +311,7 @@ static tresult comp_set_state(void* s, IBStream* st) {
         if (np && get(st, v.data(), (int)(np * 4))) for (uint32_t i = 0; i < np && (int)i < h->nparams; i++) set_hosted(h, (int)i, v[i]);
     }
     if (h->qbank >= nbanks(h)) h->qbank = 0;
-    if (h->qpage >= (int)h->pages.size()) h->qpage = 0;
+    if (!h->skin_dir.empty()) { int pg = h->qpage; reload_pages(h); h->qpage = pg < (int)h->pages.size() ? pg : 0; }
     qrefresh(h);
     return kResultOk;
 }
@@ -357,6 +363,7 @@ static void apply_param_change(Host* h, uint32_t id, double v) {   // mu held
         // a controller change from the host: timed MIDI (the caller queues it in process())
     } else if (id == kQMode) {
         h->qmode = v > 0.5 ? 8 : 4;
+        if (!h->skin_dir.empty()) reload_pages(h);
         if (h->qbank >= nbanks(h)) h->qbank = 0;
         qrefresh(h);
     } else if (id >= kPluginBase && id < kMidiBase) {
@@ -534,7 +541,7 @@ static tresult ctrl_str(void* s, uint32_t id, double v, char16* out) {
     Host* h = FROM(s, ctrl);
     std::lock_guard<std::mutex> l(h->mu);
     char b[64];
-    if (id == kPage) { int n = (int)h->pages.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "Tab %d.%d", n ? h->pages[k].tab : 0, n ? h->pages[k].sub : 0); }
+    if (id == kPage) { int n = (int)h->pages.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "%s", n && !h->pages[k].name.empty() ? h->pages[k].name.c_str() : "Page"); }
     else if (id == kPlugin) { int n = (int)h->entries.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "%s", k < n ? h->entries[k].name.c_str() : "-"); }
     else if (id == kQBank) snprintf(b, sizeof b, "Bank %d", (int)lround(v * 15) + 1);
     else if (id == kQMode) snprintf(b, sizeof b, "%s", v > 0.5 ? "8 knobs" : "4 knobs");
