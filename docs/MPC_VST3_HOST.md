@@ -91,7 +91,9 @@ Still to decide (see below): which hosts the curl shim may reach, and whether sw
 
 **M3 finding (2026-11-07):** the unchanged manager cannot install anything on a desktop even with curl, `sha256sum` and `unzip` provided. Its device probe needs `systemctl` and `systemd-run` (else "No systemctl"), it reads `MPC.settings` and the device's content locations, and an install is a restart of MPC followed by `apply.sh` and each package's `install.sh` (shell scripts, `awk`, `grep`, `cut`, `/sys/fs/cgroup`). Faking a device around that is fragile. Recommended instead: a **host-native manager service** in the module (catalog.json from open-mpc.github.io, sha256, zip unpack with a small inflate, install into `<root>/sdcard/Synths/<name>/`, rescan, switch), shown in the editor; the unchanged manager stays loadable as a plugin but is not the install path. Needs the owner's OK (see the handoff message).
 
-**Not started:** M3 onward.
+**M3 service done (2026-11-07, offline plus the live catalog, Linux):** `vst3host/installer.{h,cpp}` is the host-native manager: catalog.json (open-mpc.github.io), download (libcurl on Linux, WinHTTP on Windows), sha256, unzip with its own inflate, install of the package's `portable/<folder>` into `<root>/sdcard/Synths/<folder>/` (files the user added stay). `vst3host/pm_cli.cpp` drives it: `pm_cli list [filter]`, `pm_cli install <id> <root>`; installing the real Plugin Manager G2 0.2.5 from GitHub worked (sha256 verified, 2487 files, the .so is there). Not yet: wiring into the module and the editor's manager panel (M4); the Windows build of pm_cli is compiled, the run is pending.
+
+**Not started:** M4 (editor, manager panel), M5.
 
 **Where M1 began (done):**
 1. Create `vst3host/` with `vst3_host.cpp` (hand-written ABI: reuse `mpc-vst-plugins/wrapper/vst3_abi.h` and `resample.h`; model the factory and object layout on `mpc-vst-plugins/wrapper/vst3_wrap.c`), linking `guest.cpp hosted.cpp` and dynarmic from `poc/mpc_host/build*/` (see `build.sh` / `build_windows.sh` for flags).
