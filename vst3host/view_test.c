@@ -34,10 +34,10 @@ int main(int argc, char **argv) {
     pump(3000); snprintf(p, sizeof p, "%s-plugin.bmp", argv[2]); shot(GetWindow(w, GW_CHILD), p, r.right, r.bottom);
     HWND v = GetWindow(w, GW_CHILD);
     if (argc > 3 && !strcmp(argv[3], "skin")) {   /* DIR: REV, then drag the Density knob up, then page EDIT A */
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(785, 327)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(785, 327)); pump(300);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(103, 318)); for (int y = 318; y > 270; y -= 4) SendMessage(v, WM_MOUSEMOVE, 0, MAKELPARAM(103, y)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(103, 270)); pump(600);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(785, 295)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(785, 295)); pump(300);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(103, 286)); for (int y = 286; y > 238; y -= 4) SendMessage(v, WM_MOUSEMOVE, 0, MAKELPARAM(103, y)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(103, 238)); pump(600);
         snprintf(p, sizeof p, "%s-skinclick.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(245, 56)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(245, 56)); pump(2500);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(245, 539)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(245, 539)); pump(2500);
         snprintf(p, sizeof p, "%s-skinedit.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }

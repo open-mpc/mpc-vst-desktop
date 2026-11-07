@@ -137,9 +137,9 @@ static void paint(View* v, HDC dc, RECT cr) {
         if (!sk) text(lk.owns_lock() || h->skin ? "This plugin has no skin." : "Loading the plugin...", RECT{16, 60, VW, 90}, dim);
         else {
             int nt = (int)sk->pages.size(), tw = (VW - 32) / nt;
-            for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, 44, 16 + (i + 1) * tw - 4, 68}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);
-            const int ox = 8, oy = 76;
-            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - 6) / (float)sk->h);
+            for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, VH - 34, 16 + (i + 1) * tw - 4, VH - 8}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);   // the page tabs sit under the picture
+            const int ox = 8, oy = 44;
+            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - 42) / (float)sk->h);
             v->sscale = s;
             auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
             auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
@@ -258,7 +258,7 @@ static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: 
     std::shared_ptr<pm::Skin> sk; std::vector<float> pv;
     { std::unique_lock<std::mutex> l(h->mu, std::try_to_lock); if (!l.owns_lock()) return; sk = h->skin; pv = h->pv; }
     if (!sk || v->spage >= (int)sk->pages.size()) return;
-    double px = (x - 8) / v->sscale, py = (y - 76) / v->sscale;
+    double px = (x - 8) / v->sscale, py = (y - 44) / v->sscale;
     auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
     auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
     const auto& items = sk->pages[v->spage].items;
