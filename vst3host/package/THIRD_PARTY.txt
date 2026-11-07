@@ -1,0 +1,14 @@
+Third-party software in this package
+=====================================
+OpenMPC Host.vst3 is built from the mpc-vst-desktop repository (MIT licence, licenses\mpc-vst-desktop-LICENSE.txt) and statically links:
+  - dynarmic (ARM dynamic recompiler), 0BSD licence, https://github.com/azahar-emu/dynarmic , with its bundled fmt (MIT), mcl (MIT), xbyak (BSD-3-Clause), Zydis and Zycore (MIT), robin-map (MIT)
+  - Boost headers (Boost Software Licence), used at build time only
+  - the mingw-w64 C runtime and the GCC C++ runtime (libstdc++, libgcc), under the GCC Runtime Library Exception
+  - GDI+, WinHTTP (Windows system components)
+
+Resources\guestlibs holds libstdc++.so.6 and libgcc_s.so.1 for 32-bit ARM (armv7) and 64-bit ARM (aarch64). They are not run by Windows: the host loads them into the emulated
+ARM process so that C++ plugins find their runtime. They are the unmodified libraries from the Ubuntu cross-toolchain packages (GNU GCC runtime libraries, GPL-3.0-or-later with
+the GCC Runtime Library Exception). Their copyright files are in licenses\; the source is part of GCC, available from the Ubuntu archive (source package gcc-<version>-cross).
+
+Resources\plugins holds the OpenMPC Plugin Manager G2 (MIT licence, https://github.com/open-mpc/mpc-vst-plugins), the plugin the host opens on. Its licence is in its folder.
+No other plugin, ROM or firmware is included; plugins you install through the Manager tab come from the OpenMPC catalog with their own licences.

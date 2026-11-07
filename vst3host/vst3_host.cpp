@@ -76,6 +76,12 @@ static bool has(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f)
 // The plugins on offer: Resources/plugins/<name>/*.so next to the module, and <root>/sdcard/Synths/<name>/*.so (where the Plugin Manager installs).
 // OPENMPC_HOST_PLUGIN (a .so path) is offered first, as "(override)". The Plugin Manager is the default; Resources/default.txt names another.
 struct Entry { std::string name, so; };
+static std::string default_name() {
+    std::string name = "openmpc_pm_g2";
+    if (FILE* f = fopen((module_dir() + "/../Resources/default.txt").c_str(), "rb")) { char b[256] = {}; if (fgets(b, sizeof b, f)) { name = b; while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back(); } fclose(f); }
+    return name;
+}
+
 static std::vector<Entry> scan_plugins() {
     namespace fs = std::filesystem;
     std::vector<Entry> v;
@@ -94,14 +100,9 @@ static std::vector<Entry> scan_plugins() {
     };
     add(module_dir() + "/../Resources/plugins");
     add(user_dir() + "/sdcard/Synths");
-    std::sort(v.begin(), v.end(), [](const Entry& a, const Entry& b) { bool pa = a.name == "openmpc_pm_g2", pb = b.name == "openmpc_pm_g2"; return pa != pb ? pa : a.name < b.name; });
+    std::sort(v.begin(), v.end(), [](const Entry& a, const Entry& b) { const std::string def = default_name(); bool pa = a.name == def, pb = b.name == def; return pa != pb ? pa : a.name < b.name; });
     if (const char* e = std::getenv("OPENMPC_HOST_PLUGIN")) v.insert(v.begin(), Entry{"(override)", e});
     return v;
-}
-static std::string default_name() {
-    std::string name = "openmpc_pm_g2";
-    if (FILE* f = fopen((module_dir() + "/../Resources/default.txt").c_str(), "rb")) { char b[256] = {}; if (fgets(b, sizeof b, f)) { name = b; while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back(); } fclose(f); }
-    return name;
 }
 
 static void to16(char16* d, const std::string& s, int cap = 128) {
