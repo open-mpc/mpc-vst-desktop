@@ -3,8 +3,18 @@
 //   Manager: the OpenMPC catalog (Refresh), select a plugin and Install; it lands in <root>/sdcard/Synths and is switched to. (installer.h)
 // Immediate mode: paint() records the clickable rectangles, the mouse handlers look them up. The skin view of the hosted plugin comes later (M4b).
 #include "installer.h"
+#include <map>
+#include <algorithm>
+using std::min; using std::max;
+#include <gdiplus.h>
 
-enum HitKind { H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_PAGEPREV, H_PAGENEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
+static std::wstring W(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+enum HitKind { H_SKINPAGE, H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_PAGEPREV, H_PAGENEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
 struct Hit { RECT r; int kind, arg; };
 struct View {
     const PlugViewVtbl* vt; uint32_t refs = 1;
@@ -13,14 +23,21 @@ struct View {
     std::vector<Hit> hits;
     std::mutex sm; std::string status = "Press Refresh to read the catalog.";
     std::vector<pm::Item> items; std::atomic<bool> busy{false};
+    int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0; float sscale = 1;   // the skin tab: page, drag, scale
+    std::map<std::string, Gdiplus::Bitmap*> bmps;
+    ~View() { for (auto& kv : bmps) delete kv.second; }
 };
-static const int VW = 720, VH = 420;
-static std::wstring W(const std::string& s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
+static Gdiplus::Bitmap* skin_image(View* v, const std::string& dir, const std::string& name) {
+    if (name.empty()) return nullptr;
+    auto it = v->bmps.find(name);
+    if (it != v->bmps.end()) return it->second;
+    std::wstring w = W(dir + "/" + name);
+    Gdiplus::Bitmap* b = new Gdiplus::Bitmap(w.c_str());
+    if (b->GetLastStatus() != Gdiplus::Ok) { delete b; b = nullptr; }
+    v->bmps[name] = b;
+    return b;
 }
+static const int VW = 960, VH = 560;
 static void view_release(View* v) { if (--v->refs == 0) { Host* h = v->h; delete v; release(h); } }
 static void ui_edit(View* v, uint32_t id, double val, int phase) {   // phase 0 begin+set, 1 set, 2 set+end; the host hears it as an edit
     Host* h = v->h;
@@ -100,11 +117,75 @@ static void paint(View* v, HDC dc, RECT cr) {
     };
     text("OpenMPC Host", RECT{16, 8, 300, 36}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE, fb);
     button(RECT{330, 8, 430, 36}, "Plugin", H_TAB, 0, v->tab == 0);
-    button(RECT{436, 8, 536, 36}, "Manager", H_TAB, 1, v->tab == 1);
+    button(RECT{436, 8, 536, 36}, "Skin", H_TAB, 2, v->tab == 2);
+    button(RECT{542, 8, 642, 36}, "Manager", H_TAB, 1, v->tab == 1);
 
     Host* h = v->h;
     std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
-    if (v->tab == 0) {
+    if (v->tab == 2) {
+        std::shared_ptr<pm::Skin> sk; std::vector<float> pv; std::vector<std::string> texts;
+        if (lk.owns_lock()) {   // a snapshot, so the emulator is not held while drawing
+            sk = h->skin; pv = h->pv;
+            if (sk && v->spage >= (int)sk->pages.size()) v->spage = 0;
+            if (sk) for (auto& it : sk->pages[v->spage].items) {
+                std::string t;
+                if (it.kind == pm::SkinItem::Label) { if (it.name) t = it.text; else if (it.param >= 0 && it.param < h->nparams && h->hp) t = h->hp->param_display(it.param); }
+                texts.push_back(t);
+            }
+            lk.unlock();
+        }
+        if (!sk) text(lk.owns_lock() || h->skin ? "This plugin has no skin." : "Loading the plugin...", RECT{16, 60, VW, 90}, dim);
+        else {
+            int nt = (int)sk->pages.size(), tw = (VW - 32) / nt;
+            for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, 44, 16 + (i + 1) * tw - 4, 68}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);
+            const int ox = 8, oy = 76;
+            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - 6) / (float)sk->h);
+            v->sscale = s;
+            auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
+            auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
+            Gdiplus::Graphics g(m);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+            g.SetClip(Gdiplus::Rect(ox, oy, (int)(sk->w * s), (int)(sk->h * s)));
+            Gdiplus::SolidBrush black(Gdiplus::Color(255, 0, 0, 0));
+            g.FillRectangle(&black, ox, oy, (int)(sk->w * s), (int)(sk->h * s));
+            const auto& items = sk->pages[v->spage].items;
+            for (size_t k = 0; k < items.size(); k++) {
+                const pm::SkinItem& it = items[k];
+                if (it.kind == pm::SkinItem::Hit) continue;
+                bool shown = true;
+                for (auto& c : it.cond) shown = shown && opt(c.param, c.count) == c.option;
+                if (!shown) continue;
+                Gdiplus::Rect dst(ox + (int)lround(it.x * s), oy + (int)lround(it.y * s), (int)lround(it.w * s), (int)lround(it.h * s));
+                auto draw = [&](Gdiplus::Bitmap* b, int sy, int sh) { if (b) g.DrawImage(b, dst, 0, sy, (int)b->GetWidth(), sh, Gdiplus::UnitPixel); };
+                if (it.kind == pm::SkinItem::Img) { Gdiplus::Bitmap* b = skin_image(v, sk->dir, it.src); if (b) draw(b, 0, (int)b->GetHeight()); }
+                else if (it.kind == pm::SkinItem::Film) {
+                    Gdiplus::Bitmap* b = skin_image(v, sk->dir, it.src);
+                    if (b) {   // frames are image height / count tall; knobs carry one more square frame than numFrames says
+                        int iw = (int)b->GetWidth(), ih = (int)b->GetHeight(), n = it.frames > 0 ? it.frames : 127, nimg = ih == (n + 1) * iw ? n + 1 : n;
+                        double fh = (double)ih / nimg;
+                        int fr = (int)lround(std::min(1.0f, std::max(0.0f, val(it.param))) * (nimg - 1));
+                        draw(b, (int)(fr * fh), (int)fh);
+                    }
+                } else if (it.kind == pm::SkinItem::Btn) {
+                    bool on = it.param >= 0 && opt(it.param, it.n > 1 ? it.n : 1) == (it.n > 1 ? it.id : 1);
+                    Gdiplus::Bitmap* b = skin_image(v, sk->dir, on ? it.on : it.off);
+                    if (b) draw(b, 0, (int)b->GetHeight());
+                } else if (it.kind == pm::SkinItem::Label && k < texts.size()) {
+                    std::string t = texts[k];
+                    if (it.upper) for (auto& ch : t) ch = (char)toupper((unsigned char)ch);
+                    int style = it.style.find("Bold") != std::string::npos ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular;
+                    Gdiplus::Font font(L"Segoe UI", (Gdiplus::REAL)(it.size * s * 0.8), style, Gdiplus::UnitPixel);
+                    Gdiplus::StringFormat sf; sf.SetLineAlignment(Gdiplus::StringAlignmentCenter); sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap); sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+                    sf.SetAlignment(it.just == 'c' ? Gdiplus::StringAlignmentCenter : it.just == 'r' ? Gdiplus::StringAlignmentFar : Gdiplus::StringAlignmentNear);
+                    Gdiplus::SolidBrush br(Gdiplus::Color((it.colour >> 24) & 255, (it.colour >> 16) & 255, (it.colour >> 8) & 255, it.colour & 255));
+                    std::wstring wt = W(t);
+                    g.DrawString(wt.c_str(), (INT)wt.size(), &font, Gdiplus::RectF((Gdiplus::REAL)dst.X, (Gdiplus::REAL)dst.Y, (Gdiplus::REAL)dst.Width, (Gdiplus::REAL)dst.Height), &sf, &br);
+                }
+            }
+            g.Flush();
+        }
+    } else if (v->tab == 0) {
         if (!lk.owns_lock()) text("Loading the plugin...", RECT{16, 60, VW, 90}, dim);
         else {
             text("PLUGINS", RECT{16, 48, 220, 68}, dim);
@@ -172,6 +253,28 @@ static void paint(View* v, HDC dc, RECT cr) {
     (void)cr;
 }
 
+static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: the last visible hit under the pointer
+    Host* h = v->h;
+    std::shared_ptr<pm::Skin> sk; std::vector<float> pv;
+    { std::unique_lock<std::mutex> l(h->mu, std::try_to_lock); if (!l.owns_lock()) return; sk = h->skin; pv = h->pv; }
+    if (!sk || v->spage >= (int)sk->pages.size()) return;
+    double px = (x - 8) / v->sscale, py = (y - 76) / v->sscale;
+    auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
+    auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
+    const auto& items = sk->pages[v->spage].items;
+    for (int i = (int)items.size() - 1; i >= 0; i--) {
+        const pm::SkinItem& it = items[i];
+        if (it.kind != pm::SkinItem::Hit || px < it.x || py < it.y || px >= it.x + it.w || py >= it.y + it.h) continue;
+        bool shown = true;
+        for (auto& c : it.cond) shown = shown && opt(c.param, c.count) == c.option;
+        if (!shown || it.param < 0) continue;
+        uint32_t id = kPluginBase + it.param;
+        if (it.mode == pm::SkinItem::Radio) { ui_edit(v, id, it.n > 1 ? (double)it.id / (it.n - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, id); }
+        else if (it.mode == pm::SkinItem::Toggle) { ui_edit(v, id, val(it.param) > 0.5f ? 0 : 1, 0); if (h->handler) h->handler->v->endEdit(h->handler, id); }
+        else if (it.mode == pm::SkinItem::Drag) { v->sdrag = it.param; v->sdragy = y; v->sdragv = val(it.param); if (h->handler) h->handler->v->beginEdit(h->handler, id); }
+        return;
+    }
+}
 static void click(View* v, int x, int y) {
     Host* h = v->h;
     for (int i = (int)v->hits.size() - 1; i >= 0; i--) {
@@ -179,6 +282,12 @@ static void click(View* v, int x, int y) {
         if (x < ht.r.left || x >= ht.r.right || y < ht.r.top || y >= ht.r.bottom) continue;
         switch (ht.kind) {
             case H_TAB: v->tab = ht.arg; break;
+            case H_SKINPAGE: {   // the skin's tab also picks the matching Q-Link page, as on the device
+                v->spage = ht.arg;
+                int np = (int)h->pages.size();
+                for (int j = 0; j < np; j++) if (h->pages[j].tab == ht.arg + 1 && h->pages[j].sub == 1) { ui_edit(v, kPage, np > 1 ? j / (double)(np - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kPage); break; }
+                break;
+            }
             case H_PLUGIN: { std::lock_guard<std::mutex> l(h->mu); request_switch(h, ht.arg); break; }
             case H_MODE: ui_edit(v, kQMode, h->qmode == 4 ? 1 : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kQMode); break;
             case H_BANKPREV: case H_BANKNEXT: {
@@ -199,6 +308,7 @@ static void click(View* v, int x, int y) {
         }
         return;
     }
+    if (v->tab == 2) skin_click(v, x, y);
 }
 
 static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp);
@@ -216,6 +326,10 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER: InvalidateRect(w, nullptr, FALSE); return 0;
         case WM_LBUTTONDOWN: SetCapture(w); click(v, (short)LOWORD(lp), (short)HIWORD(lp)); InvalidateRect(w, nullptr, FALSE); return 0;
         case WM_MOUSEMOVE:
+            if (v->sdrag >= 0) {
+                double val = v->sdragv + (v->sdragy - (short)HIWORD(lp)) / 150.0;
+                ui_edit(v, kPluginBase + v->sdrag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
+            }
             if (v->drag >= 0) {
                 double val = v->dragv + (v->dragy - (short)HIWORD(lp)) / 150.0;
                 ui_edit(v, kQLink1 + v->drag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
@@ -223,6 +337,7 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONUP:
             ReleaseCapture();
+            if (v->sdrag >= 0) { Host* h = v->h; if (h->handler) h->handler->v->endEdit(h->handler, kPluginBase + v->sdrag); v->sdrag = -1; }
             if (v->drag >= 0) { Host* h = v->h; if (h->handler) h->handler->v->endEdit(h->handler, kQLink1 + v->drag); v->drag = -1; }
             return 0;
         case WM_MOUSEWHEEL:
@@ -244,6 +359,8 @@ static tresult pv_attached(void* s, void* parent, const char* type) {
     View* v = (View*)((char*)s - offsetof(View, vt));
     if (strcmp(type, "HWND")) return kResultFalse;
     static bool reg = false;
+    static ULONG_PTR gdip = 0;
+    if (!gdip) { Gdiplus::GdiplusStartupInput in; Gdiplus::GdiplusStartup(&gdip, &in, nullptr); }
     if (!reg) {
         WNDCLASSA wc{}; wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleA(nullptr); wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.lpszClassName = "OpenMPCHostView";
         RegisterClassA(&wc); reg = true;
@@ -268,4 +385,6 @@ static tresult pv_frame(void* s, void* f) { View* v = (View*)((char*)s - offseto
 static tresult pv_can_resize(void*) { return kResultFalse; }
 static tresult pv_check(void*, ViewRect* r) { r->right = r->left + VW; r->bottom = r->top + VH; return kResultOk; }
 static const PlugViewVtbl pv_vtbl = {pv_query, pv_ref, pv_rel, pv_supported, pv_attached, pv_removed, pv_nop, pv_key, pv_key, pv_size, pv_onsize, pv_focus, pv_frame, pv_can_resize, pv_check};
-static void* create_view(Host* h) { View* v = new View(); v->vt = &pv_vtbl; v->h = h; h->refs++; return &v->vt; }
+static void* create_view(Host* h) { View* v = new View(); v->vt = &pv_vtbl; v->h = h; h->refs++;
+    { std::lock_guard<std::mutex> l(h->mu); if (h->skin) v->tab = 2; }
+    return &v->vt; }

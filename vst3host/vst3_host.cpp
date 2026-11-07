@@ -25,6 +25,8 @@
 #include "../mpc-vst-plugins/wrapper/resample.h"
 #include "../poc/mpc_host/hosted.h"
 #include "installer.h"
+#include "skin.h"
+#include <memory>
 
 using mpchost::HostedPlugin;
 
@@ -123,6 +125,7 @@ struct Host {
     int nparams = 0;
     std::vector<float> pv;            // the host's view of each hosted parameter
     std::string skin_dir;
+    std::shared_ptr<pm::Skin> skin;   // the hosted plugin's skin (null: none)
     std::vector<pm::QPage> pages; int qpage = 0;   // the skin's Q-Link sets
     int qmode = 4, qbank = 0;         // Q-Link section: 4 or 8 knobs, and the bank shown
     double qval[8] = {};              // the knobs' own normalised values (what the host sees)
@@ -173,7 +176,7 @@ static void reload_pages(Host* h, bool names = false) {   // the skin's Q-Link s
     if (h->qpage >= (int)h->pages.size()) h->qpage = 0;
 }
 static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the hosted plugin
-    h->pages.clear(); delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
+    h->skin = nullptr; h->pages.clear(); delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
     qrefresh(h);
     if (idx < 0 || idx >= (int)h->entries.size()) return false;
     const std::string so = h->entries[idx].so;
@@ -190,6 +193,11 @@ static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the ho
     h->qbank = 0; h->qpage = 0;
     h->skin_dir = so.substr(0, so.find_last_of('/') == std::string::npos ? 0 : so.find_last_of('/')) + "/Plugin Skins";
     reload_pages(h, true);
+    {
+        auto sk = std::make_shared<pm::Skin>();
+        std::string e;
+        h->skin = pm::load_skin(h->skin_dir, *sk, e) ? sk : nullptr;
+    }
     qrefresh(h);
     return true;
 }

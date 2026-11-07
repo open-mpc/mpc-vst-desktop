@@ -12,7 +12,7 @@ if [ ! -f "$B/src/dynarmic/libdynarmic.a" ]; then
 fi
 mkdir -p "$BUNDLE/Contents/x86_64-linux" "$BUNDLE/Contents/Resources/plugins"
 LIBS=$(find "$B" -name '*.a' | grep -v libdynarmic.a | tr '\n' ' ')
-g++ -std=c++20 -O2 -g -Wall -Wno-reorder -shared -fPIC -fvisibility=hidden -I"$DYN/src" -I"$DYN/externals/mcl/include" "$HERE/vst3_host.cpp" "$HERE/installer.cpp" "$MH/guest.cpp" "$MH/hosted.cpp" \
+g++ -std=c++20 -O2 -g -Wall -Wno-reorder -shared -fPIC -fvisibility=hidden -I"$DYN/src" -I"$DYN/externals/mcl/include" "$HERE/vst3_host.cpp" "$HERE/installer.cpp" "$HERE/skin.cpp" "$MH/guest.cpp" "$MH/hosted.cpp" \
     "$B/src/dynarmic/libdynarmic.a" $LIBS $LIBS -ldl -lpthread -o "$BUNDLE/Contents/x86_64-linux/OpenMPC Host.so"
 for h in guest_helpers.so guest_helpers64.so; do [ -f "$MH/build/$h" ] && cp "$MH/build/$h" "$BUNDLE/Contents/Resources/"; done
 echo "built $BUNDLE"
