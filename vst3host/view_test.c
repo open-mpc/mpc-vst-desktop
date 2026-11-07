@@ -36,6 +36,13 @@ int main(int argc, char **argv) {
     printf("click tab -> %lld\n", (long long)SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(480, 20))); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(480, 20)); pump(300);   /* Manager tab */
     SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(60, 60)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(60, 60));    /* Refresh */
     pump(6000); snprintf(p, sizeof p, "%s-manager.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+    if (argc > 3) {   /* install the 4th catalog row ("Acid"), then look at the Plugin tab */
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(100, 84 + 3 * 24 + 5)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(100, 161));
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(170, 60)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(170, 60));
+        pump(25000); snprintf(p, sizeof p, "%s-status.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(380, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(380, 20));
+        pump(4000); snprintf(p, sizeof p, "%s-after.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+    }
     view->v->removed(view);
     printf("ok\n");
     return 0;

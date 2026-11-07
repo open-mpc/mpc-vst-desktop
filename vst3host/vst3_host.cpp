@@ -64,6 +64,10 @@ static std::string user_dir() {   // where the hosted plugins' "/" lives (their 
     return std::string(h ? h : ".") + "/.local/share/openmpc-host/root";
 #endif
 }
+static void logf(const std::string& m) {   // <root>/openmpc-host.log, for support
+    FILE* f = fopen((user_dir() + "/openmpc-host.log").c_str(), "ab");
+    if (f) { fwrite(m.data(), 1, m.size(), f); fputc('\n', f); fclose(f); }
+}
 static bool has(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) fclose(f); return f != nullptr; }
 
 // The plugins on offer: Resources/plugins/<name>/*.so next to the module, and <root>/sdcard/Synths/<name>/*.so (where the Plugin Manager installs).
@@ -112,7 +116,7 @@ struct Host {
     uint32_t refs = 1;
     std::mutex mu;                    // the emulator is one CPU: one call at a time
     HostedPlugin* hp = nullptr;
-    std::string load_error;
+    std::string load_error, switch_error;
     std::vector<Entry> entries; int cur = -1; std::atomic<bool> switching{false};
     IComponentHandler* handler = nullptr;
     int nparams = 0;
@@ -172,12 +176,15 @@ static bool load(Host* h, const std::string& want = "") {   // first load: scan,
 }
 static uint32_t release(Host* h);
 static void request_switch(Host* h, int idx) {   // from any thread; the load happens on a worker so the audio thread never waits for it (process() skips while it runs)
+    logf("switch to " + std::to_string(idx) + " (now " + std::to_string(h->cur) + ", of " + std::to_string(h->entries.size()) + ")");
     if (idx == h->cur || idx < 0 || idx >= (int)h->entries.size() || h->switching.exchange(true)) return;
     h->refs++;
     std::thread([h, idx] {
         {
             std::lock_guard<std::mutex> l(h->mu);
-            load_index(h, idx);
+            int prev = h->cur;
+            if (!load_index(h, idx)) { h->switch_error = h->entries[idx].name + ": " + h->load_error; logf(h->switch_error); load_index(h, prev); }   // a plugin that will not load leaves the old one running
+            else h->switch_error.clear();
         }
         h->switching = false;
         if (h->handler) h->handler->v->restartComponent(h->handler, 1 | 4);   // values and titles changed: the host re-reads the parameter list

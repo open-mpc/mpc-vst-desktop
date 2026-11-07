@@ -113,7 +113,8 @@ static void paint(View* v, HDC dc, RECT cr) {
                 button(RECT{16, y, 230, y + 24}, h->entries[i].name, H_PLUGIN, i, i == h->cur);
             RECT qp{250, 48, VW - 16, VH - 16}; box(qp, panel);
             std::string pn = h->hp ? h->hp->name() : h->load_error;
-            text(pn.empty() ? "(unnamed)" : pn, RECT{262, 54, VW - 30, 80}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, fb);
+            text(pn.empty() ? "(unnamed)" : pn, RECT{262, 54, VW - 30, 66}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, fb);
+            if (!h->switch_error.empty()) text(h->switch_error, RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             text("Q-LINKS", RECT{262, 86, 400, 104}, dim);
             button(RECT{262, 108, 342, 134}, h->qmode == 4 ? "4 knobs" : "8 knobs", H_MODE, 0);
             button(RECT{352, 108, 382, 134}, "<", H_BANKPREV, 0);
@@ -141,7 +142,7 @@ static void paint(View* v, HDC dc, RECT cr) {
             (void)rows;
         }
     } else {
-        lk.unlock();
+        if (lk.owns_lock()) lk.unlock();
         std::lock_guard<std::mutex> l(v->sm);
         button(RECT{16, 48, 116, 74}, "Refresh", H_REFRESH, 0);
         button(RECT{124, 48, 224, 74}, "Install", H_INSTALL, 0, v->msel >= 0);
