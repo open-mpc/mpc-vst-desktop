@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <filesystem>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -28,7 +31,7 @@ using mpchost::HostedPlugin;
 enum : uint32_t {
     kQLink1 = 1,          // 1..8
     kQBank = 9, kQNext = 10, kQMode = 11,
-    kBypass = 12,
+    kBypass = 12, kPlugin = 13,   // Plugin: the hosted plugin, as a list
     kPluginBase = 100,
     kMidiBase = 100000,   // + channel*130 + controller (0..127 CC, 128 channel pressure, 129 pitch bend): hidden, for IMidiMapping    // 100 + hosted parameter index
 };
@@ -63,14 +66,35 @@ static std::string user_dir() {   // where the hosted plugins' "/" lives (their 
 }
 static bool has(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) fclose(f); return f != nullptr; }
 
-// The plugin to host: OPENMPC_HOST_PLUGIN (a .so path), else Resources/default.txt (a folder name under Resources/plugins/), else the manager.
-static std::string find_plugin(std::string& dir) {
-    if (const char* e = std::getenv("OPENMPC_HOST_PLUGIN")) { std::string s = e; size_t k = s.rfind('/'); dir = k == std::string::npos ? "." : s.substr(0, k); return s; }
-    const std::string res = module_dir() + "/../Resources";
+// The plugins on offer: Resources/plugins/<name>/*.so next to the module, and <root>/sdcard/Synths/<name>/*.so (where the Plugin Manager installs).
+// OPENMPC_HOST_PLUGIN (a .so path) is offered first, as "(override)". The Plugin Manager is the default; Resources/default.txt names another.
+struct Entry { std::string name, so; };
+static std::vector<Entry> scan_plugins() {
+    namespace fs = std::filesystem;
+    std::vector<Entry> v;
+    auto add = [&](const std::string& dir) {
+        std::error_code ec;
+        for (auto& d : fs::directory_iterator(dir, ec)) {
+            if (!d.is_directory(ec)) continue;
+            std::string so;
+            for (auto& f : fs::directory_iterator(d.path(), ec)) if (f.path().extension() == ".so") { so = f.path().generic_string(); break; }
+            std::string nm = d.path().filename().string();
+            if (so.empty()) continue;
+            bool dup = false;
+            for (auto& e : v) dup |= e.name == nm;
+            if (!dup) v.push_back({nm, so});
+        }
+    };
+    add(module_dir() + "/../Resources/plugins");
+    add(user_dir() + "/sdcard/Synths");
+    std::sort(v.begin(), v.end(), [](const Entry& a, const Entry& b) { bool pa = a.name == "openmpc_pm_g2", pb = b.name == "openmpc_pm_g2"; return pa != pb ? pa : a.name < b.name; });
+    if (const char* e = std::getenv("OPENMPC_HOST_PLUGIN")) v.insert(v.begin(), Entry{"(override)", e});
+    return v;
+}
+static std::string default_name() {
     std::string name = "openmpc_pm_g2";
-    if (FILE* f = fopen((res + "/default.txt").c_str(), "rb")) { char b[256] = {}; if (fgets(b, sizeof b, f)) { name = b; while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back(); } fclose(f); }
-    dir = res + "/plugins/" + name;
-    return dir + "/" + name + ".so";
+    if (FILE* f = fopen((module_dir() + "/../Resources/default.txt").c_str(), "rb")) { char b[256] = {}; if (fgets(b, sizeof b, f)) { name = b; while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back(); } fclose(f); }
+    return name;
 }
 
 static void to16(char16* d, const std::string& s, int cap = 128) {
@@ -89,6 +113,7 @@ struct Host {
     std::mutex mu;                    // the emulator is one CPU: one call at a time
     HostedPlugin* hp = nullptr;
     std::string load_error;
+    std::vector<Entry> entries; int cur = -1; std::atomic<bool> switching{false};
     IComponentHandler* handler = nullptr;
     int nparams = 0;
     std::vector<float> pv;            // the host's view of each hosted parameter
@@ -117,22 +142,47 @@ static void set_hosted(Host* h, int p, double v) {   // callers hold mu
     for (int k = 0; k < h->qmode; k++) if (qparam(h, k) == p) h->qval[k] = v;
 }
 
-static bool load(Host* h) {   // callers hold mu
-    if (h->hp) return true;
-    std::string dir, so = find_plugin(dir);
-    if (!has(so)) { h->load_error = "plugin not found: " + so; return false; }
+static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the hosted plugin
+    delete h->hp; h->hp = nullptr; h->nparams = 0; h->pv.clear(); h->cur = -1;
+    qrefresh(h);
+    if (idx < 0 || idx >= (int)h->entries.size()) return false;
+    const std::string so = h->entries[idx].so;
     auto* hp = new HostedPlugin();
     HostedPlugin::Config cfg;
     cfg.root = user_dir();
     cfg.support_dir = module_dir() + "/../Resources";
     if (!hp->open(so, cfg, h->load_error)) { delete hp; return false; }
     hp->start();
-    h->hp = hp;
+    h->hp = hp; h->cur = idx;
     h->nparams = hp->num_params();
     h->pv.assign(h->nparams, 0);
     for (int i = 0; i < h->nparams; i++) h->pv[i] = hp->get_param(i);
+    h->qbank = 0;
     qrefresh(h);
     return true;
+}
+static bool load(Host* h, const std::string& want = "") {   // first load: scan, then the wanted plugin or the default; callers hold mu
+    if (h->hp) return true;
+    h->entries = scan_plugins();
+    std::string w = want.empty() ? default_name() : want;
+    int idx = h->entries.empty() ? -1 : 0;
+    for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == w) { idx = i; break; }
+    if (h->entries.empty()) h->load_error = "no plugins found";
+    return load_index(h, idx);
+}
+static uint32_t release(Host* h);
+static void request_switch(Host* h, int idx) {   // from any thread; the load happens on a worker so the audio thread never waits for it (process() skips while it runs)
+    if (idx == h->cur || idx < 0 || idx >= (int)h->entries.size() || h->switching.exchange(true)) return;
+    h->refs++;
+    std::thread([h, idx] {
+        {
+            std::lock_guard<std::mutex> l(h->mu);
+            load_index(h, idx);
+        }
+        h->switching = false;
+        if (h->handler) h->handler->v->restartComponent(h->handler, 1 | 4);   // values and titles changed: the host re-reads the parameter list
+        release(h);
+    }).detach();
 }
 
 static void rs_reset(Host* h) {
@@ -197,9 +247,10 @@ static tresult comp_get_state(void* s, IBStream* st) {
     Host* h = FROM(s, comp);
     std::lock_guard<std::mutex> l(h->mu);
     std::vector<uint8_t> chunk = h->hp ? h->hp->get_chunk() : std::vector<uint8_t>();
-    uint32_t magic = 0x3148504f /* "OPH1" */, n = (uint32_t)chunk.size(), np = (uint32_t)h->pv.size();
+    uint32_t magic = 0x3248504f /* "OPH2" */, n = (uint32_t)chunk.size(), np = (uint32_t)h->pv.size();
     uint8_t q[2] = {(uint8_t)h->qmode, (uint8_t)h->qbank};
-    put(st, &magic, 4); put(st, q, 2); put(st, &n, 4); if (n) put(st, chunk.data(), (int)n);
+    uint16_t nl = (uint16_t)(h->cur >= 0 ? h->entries[h->cur].name.size() : 0);
+    put(st, &magic, 4); put(st, &nl, 2); if (nl) put(st, h->entries[h->cur].name.data(), nl); put(st, q, 2); put(st, &n, 4); if (n) put(st, chunk.data(), (int)n);
     put(st, &np, 4); if (np) put(st, h->pv.data(), (int)(np * 4));
     return kResultOk;
 }
@@ -208,7 +259,12 @@ static tresult comp_set_state(void* s, IBStream* st) {
     std::lock_guard<std::mutex> l(h->mu);
     uint32_t magic = 0, n = 0, np = 0;
     uint8_t q[2];
-    if (!get(st, &magic, 4) || magic != 0x3148504f || !get(st, q, 2) || !get(st, &n, 4) || n > (64u << 20)) return kResultFalse;
+    uint16_t nl = 0;
+    if (!get(st, &magic, 4) || magic != 0x3248504f || !get(st, &nl, 2)) return kResultFalse;
+    std::string pname(nl, 0);
+    if (nl && !get(st, &pname[0], nl)) return kResultFalse;
+    if (!h->switching && (h->cur < 0 || h->entries[h->cur].name != pname)) { for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == pname) { load_index(h, i); break; } }
+    if (!get(st, q, 2) || !get(st, &n, 4) || n > (64u << 20)) return kResultFalse;
     std::vector<uint8_t> chunk(n);
     if (n && !get(st, chunk.data(), (int)n)) return kResultFalse;
     h->qmode = q[0] == 8 ? 8 : 4; h->qbank = q[1];
@@ -259,6 +315,9 @@ static void apply_param_change(Host* h, uint32_t id, double v) {   // mu held
     } else if (id == kQBank) {
         int b = (int)lround(v * 15);
         if (b < nbanks(h)) { h->qbank = b; qrefresh(h); }
+    } else if (id == kPlugin) {
+        int n = (int)h->entries.size();
+        if (n > 1) request_switch(h, (int)lround(v * (n - 1)));
     } else if (id == kBypass) {
         h->bypass = v > 0.5;
     } else if (id >= kMidiBase) {
@@ -274,8 +333,11 @@ static void apply_param_change(Host* h, uint32_t id, double v) {   // mu held
 
 static tresult proc_process(void* s, ProcessData* d) {
     Host* h = FROM(s, proc);
-    std::lock_guard<std::mutex> lk(h->mu);
-    if (!h->hp || !h->rs) return kResultFalse;
+    std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
+    if (!lk.owns_lock() || !h->hp || !h->rs) {   // a plugin switch is loading: silence for now
+        if (d->numOutputs > 0) for (int c = 0; c < d->outputs[0].numChannels; c++) memset(d->outputs[0].channelBuffers32[c], 0, d->numSamples * 4);
+        return kResultOk;
+    }
     int n = d->numSamples;
     // the Next Bank button reports a press as a rise through 0.5: remember the last value to see the edge
     double& next_last = h->next_last;
@@ -366,12 +428,12 @@ static tresult ctrl_set_comp_state(void*, IBStream*) { return kResultOk; }   // 
 static tresult ctrl_set_state(void*, IBStream*) { return kResultOk; }
 static tresult ctrl_get_state(void*, IBStream*) { return kResultOk; }
 // Parameters: Q-Link 1..8, Q-Link Bank, Next Bank, Q-Link Mode, then every parameter of the hosted plugin.
-static int32_t ctrl_count(void* s) { Host* h = FROM(s, ctrl); std::lock_guard<std::mutex> l(h->mu); return 12 + h->nparams + 16 * 130; }
-static uint32_t id_at(int i, int np) { return i < 8 ? kQLink1 + i : i < 11 ? kQBank + (i - 8) : i == 11 ? kBypass : i < 12 + np ? kPluginBase + (i - 12) : kMidiBase + (i - 12 - np); }
+static int32_t ctrl_count(void* s) { Host* h = FROM(s, ctrl); std::lock_guard<std::mutex> l(h->mu); return 13 + h->nparams + 16 * 130; }
+static uint32_t id_at(int i, int np) { return i < 8 ? kQLink1 + i : i < 11 ? kQBank + (i - 8) : i == 11 ? kBypass : i == 12 ? kPlugin : i < 13 + np ? kPluginBase + (i - 13) : kMidiBase + (i - 13 - np); }
 static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
     Host* h = FROM(s, ctrl);
     std::lock_guard<std::mutex> l(h->mu);
-    if (i < 0 || i >= 12 + h->nparams + 16 * 130) return kInvalidArgument;
+    if (i < 0 || i >= 13 + h->nparams + 16 * 130) return kInvalidArgument;
     memset(pi, 0, sizeof *pi);
     pi->id = id_at(i, h->nparams);
     if (pi->id >= kMidiBase) {
@@ -384,6 +446,13 @@ static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
         pi->stepCount = c == 129 ? 0 : 127; pi->defaultNormalizedValue = c == 129 ? 0.5 : 0; pi->flags = kIsHidden | kIsReadOnly;
         return kResultOk;
     }
+    if (pi->id == kPlugin) {
+        to16(pi->title, "Plugin"); to16(pi->shortTitle, "Plugin");
+        int n = (int)h->entries.size();
+        pi->stepCount = n > 1 ? n - 1 : 1; pi->flags = kCanAutomate | kIsList | kIsProgramChange;
+        pi->defaultNormalizedValue = 0;
+        return kResultOk;
+    }
     if (pi->id == kBypass) { to16(pi->title, "Bypass"); to16(pi->shortTitle, "Bypass"); pi->stepCount = 1; pi->flags = kCanAutomate | kIsBypass; return kResultOk; }
     std::string t;
     if (i < 8) { t = "Q-Link " + std::to_string(i + 1); pi->flags = kCanAutomate; }
@@ -391,7 +460,7 @@ static tresult ctrl_info(void* s, int32_t i, ParameterInfo* pi) {
     else if (pi->id == kQNext) { t = "Q-Link Next Bank"; pi->stepCount = 1; pi->flags = kCanAutomate; }
     else if (pi->id == kQMode) { t = "Q-Link Mode (4/8)"; pi->stepCount = 1; pi->flags = kCanAutomate | kIsList; }
     else {
-        int p = i - 12;
+        int p = i - 13;
         t = h->hp ? h->hp->param_name(p) : "Param";
         if (t.empty()) t = "Param " + std::to_string(p + 1);
         pi->defaultNormalizedValue = h->pv[p];
@@ -409,6 +478,7 @@ static double ctrl_get(void* s, uint32_t id) {
     if (id == kQBank) return h->qbank / 15.0;
     if (id == kQNext) return 0;
     if (id == kBypass) return h->bypass;
+    if (id == kPlugin) return h->entries.size() > 1 && h->cur >= 0 ? h->cur / (double)(h->entries.size() - 1) : 0;
     if (id >= kMidiBase) return (id - kMidiBase) % 130 == 129 ? 0.5 : 0;
     if (id == kQMode) return h->qmode == 8 ? 1 : 0;
     int p = (int)id - (int)kPluginBase;
@@ -425,7 +495,8 @@ static tresult ctrl_str(void* s, uint32_t id, double v, char16* out) {
     Host* h = FROM(s, ctrl);
     std::lock_guard<std::mutex> l(h->mu);
     char b[64];
-    if (id == kQBank) snprintf(b, sizeof b, "Bank %d", (int)lround(v * 15) + 1);
+    if (id == kPlugin) { int n = (int)h->entries.size(), k = n > 1 ? (int)lround(v * (n - 1)) : 0; snprintf(b, sizeof b, "%s", k < n ? h->entries[k].name.c_str() : "-"); }
+    else if (id == kQBank) snprintf(b, sizeof b, "Bank %d", (int)lround(v * 15) + 1);
     else if (id == kQMode) snprintf(b, sizeof b, "%s", v > 0.5 ? "8 knobs" : "4 knobs");
     else if (id == kQNext) snprintf(b, sizeof b, "%s", v > 0.5 ? "Next" : "-");
     else {
