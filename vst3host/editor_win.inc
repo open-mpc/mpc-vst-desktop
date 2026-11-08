@@ -19,7 +19,9 @@ enum HitKind { H_MENU, H_MENUCLOSE, H_BANK, H_SKINPAGE, H_TAB, H_PLUGIN, H_MODE,
 struct Hit { RECT r; int kind, arg; };
 struct QSnap { int mode = 4, bank = 0, nbanks = 1, page = 0, npages = 0; std::string pagename; double val[8] = {}; bool act[8] = {}; std::string name[8], disp[8]; };
 struct TabSnap { bool ok = false; std::vector<std::string> names; int cur = -1; std::string pname, err; QSnap q; };   // what the generic tabs draw: taken under the emulator lock, drawn without it
-static const int kQStripH = 112;   // the Q-Link strip: a 26 px button row, then four or eight horizontal faders
+// The faceplate (logical pixels): header, the screen in a bezel, a row of function keys, a control row (Q-Link button, banks, knobs). The window is this scaled to fit.
+static const int kHdr = 44, kPad = 20, kBez = 14, kKeysGap = 10, kKeysH = 30, kCtlGap = 16, kCtlH = 100, kBot = 20;
+static const int kExtraH = kHdr + kBez + kBez + kKeysGap + kKeysH + kCtlGap + kCtlH + kBot;   // everything but the screen
 struct View {
     const PlugViewVtbl* vt; uint32_t refs = 1;
     Host* h; HWND wnd = nullptr; void* frame = nullptr;
@@ -29,9 +31,12 @@ struct View {
     std::vector<pm::Item> items; std::atomic<bool> busy{false};
     TabSnap ts; std::map<int, std::string> ncache; int nc_cur = -2; std::string pname_s; RECT qtrack[8] = {};
     bool menu = false;   // the plugin list (a drop-down under the header) is open
-    int vw = kMinW, vh = kMinH;   // the window's size in pixels
+    int lw = kMinW, lh = kMinH;   // logical size: what paint() lays out
+    int vw = kMinW, vh = kMinH;   // the window's size in pixels (the logical size times the scale)
+    int sox = 0, soy = 0;         // where the skin picture sits on the plate
+    double kdragy = 0, kdragv = 0;   // the window's size in pixels
     std::shared_ptr<pm::Skin> csk; std::vector<float> cpv; std::vector<std::string> ctexts; int cpage_ = -1;   // the last snapshot of the skin page: drawn when the emulator is busy
-    int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0; float sscale = 1;   // the skin tab: page, drag, scale
+    int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0;   // the skin tab: page, drag, scale
     std::map<std::string, Gdiplus::Bitmap*> bmps; std::string bmps_dir;   // the picture cache is for one plugin's skin folder; file names repeat between plugins (sh_bg_0.png)
     ~View() { for (auto& kv : bmps) delete kv.second; }
 };
@@ -46,8 +51,8 @@ static Gdiplus::Bitmap* skin_image(View* v, const std::string& dir, const std::s
     v->bmps[name] = b;
     return b;
 }
-#define VW (v->vw)
-#define VH (v->vh)
+#define VW (v->lw)
+#define VH (v->lh)
 static void view_release(View* v) { if (--v->refs == 0) { Host* h = v->h; delete v; release(h); } }
 static void ui_edit(View* v, uint32_t id, double val, int phase) {   // phase 0 begin+set, 1 set, 2 set+end; the host hears it as an edit
     Host* h = v->h;
@@ -133,11 +138,24 @@ static void take_snap(View* v, Host* h) {   // the emulator lock is held: a few 
 }
 // The window the hosted plugin's skin wants: its native pixels (a 1280x628 page) plus our header (44) and page tabs (42), never smaller than the generic tabs.
 static void want_size(Host* h, int& w, int& hh) {
-    w = kMinW; hh = kMinH;
-    if (h->skin) { w = std::max(kMinW, h->skin->w + 16); hh = std::max(kMinH, 44 + h->skin->h + kQStripH + 42); }
+    const int sw = h->skin ? h->skin->w : 1024, sh = h->skin ? h->skin->h : 480;   // a plugin without a skin gets a blank screen
+    w = std::max(kMinW, sw + 2 * (kPad + kBez)); hh = std::max(kMinH, sh + kExtraH);
 }
-static void resize_view(View* v, int w, int h) {   // ask the host for a new window size (it calls onSize); the window follows at once
-    if (w == v->vw && h == v->vh) return;
+// The window size for a logical size: 1:1 when it fits the screen the host window is on, else scaled down (never below 40%).
+static double fit_scale(HWND any, int lw, int lh) {
+    RECT wa{0, 0, 1920, 1040};
+    HMONITOR mon = MonitorFromWindow(any ? any : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof mi};
+    if (GetMonitorInfo(mon, &mi)) wa = mi.rcWork;
+    double sx = (wa.right - wa.left - 40.0) / lw, sy = (wa.bottom - wa.top - 110.0) / lh;   // room for the DAW's own frame
+    double sc = std::min(1.0, std::min(sx, sy));
+    return sc < 0.4 ? 0.4 : sc;
+}
+static void resize_view(View* v, int lw, int lh) {   // the logical size changed (another plugin's skin): ask the host for the new window size (it calls onSize); the window follows at once
+    if (lw == v->lw && lh == v->lh) return;
+    const double sc = v->lw > 0 ? (double)v->vw / v->lw : 1.0;
+    v->lw = lw; v->lh = lh;
+    const int w = (int)lround(lw * sc), h = (int)lround(lh * sc);
     v->vw = w; v->vh = h;
     if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
     if (v->frame) { ViewRect r{0, 0, w, h}; ((PlugFrameVtbl* const*)v->frame)[0]->resizeView(v->frame, &v->vt, &r); }
@@ -167,49 +185,84 @@ static void paint(View* v, HDC dc, RECT cr) {
     std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
     if (lk.owns_lock()) take_snap(v, h);
     const TabSnap& S = v->ts;
-    // one header, as on the MPC: the plugin (a drop-down list of what is installed) and the catalog; the skin's own page tabs are the only tab row
-    text("OpenMPC Host", RECT{16, 8, 190, 36}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE, fb);
-    if (v->tab == 1) button(RECT{200, 8, 340, 36}, "<  Back to plugin", H_TAB, 2);
-    else {
-        const std::string pl = S.ok ? (S.pname.empty() && S.cur >= 0 && S.cur < (int)S.names.size() ? S.names[S.cur] : S.pname) : "Loading...";
-        button(RECT{200, 8, 520, 36}, pl + "   \xE2\x96\xBE", H_MENU, 0, v->menu);
-        button(RECT{528, 8, 640, 36}, "Manager", H_TAB, 1);
+    // the manager view has a plain header; the plugin view draws its own header on the faceplate
+    if (v->tab == 1) {
+        text("OpenMPC Host", RECT{16, 8, 190, 36}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE, fb);
+        button(RECT{200, 8, 340, 36}, "<  Back to plugin", H_TAB, 2);
     }
-    auto qstrip = [&](int x, int y, int w) {   // the Q-Link section: a panel with mode, numbered bank buttons and Next, then 4 or 8 horizontal faders in one row
+    // ---- the faceplate: GDI+ shapes first (smooth edges), the text of all of it last (GDI, ClearType) ----
+    Gdiplus::Graphics pg(m);
+    pg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    struct PT { std::string t; RECT r; COLORREF c; UINT fl; bool bold; };
+    std::vector<PT> pend;
+    auto ptext = [&](const std::string& t, RECT r, COLORREF c, UINT fl = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, bool bold = false) { pend.push_back({t, r, c, fl, bold}); };
+    auto flush_text = [&]() { pg.Flush(); for (auto& p : pend) text(p.t, p.r, p.c, p.fl, p.bold ? fb : nullptr); pend.clear(); };
+    auto fillrr = [&](float x, float y, float w, float h, float r, Gdiplus::Color c1, Gdiplus::Color c2) {
+        Gdiplus::GraphicsPath gp;
+        gp.AddArc(x, y, 2 * r, 2 * r, 180, 90); gp.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
+        gp.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90); gp.AddArc(x, y + h - 2 * r, 2 * r, 2 * r, 90, 90); gp.CloseFigure();
+        Gdiplus::LinearGradientBrush b(Gdiplus::PointF(x, y), Gdiplus::PointF(x, y + h), c1, c2);
+        pg.FillPath(&b, &gp);
+        Gdiplus::Pen pen(Gdiplus::Color(255, 14, 15, 18), 1);
+        pg.DrawPath(&pen, &gp);
+    };
+    auto pbtn = [&](RECT r, const std::string& t, int kind, int arg, bool on = false) {   // a hardware-style key: lit orange when on
+        if (on) fillrr((float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), 6, Gdiplus::Color(255, 255, 170, 72), Gdiplus::Color(255, 232, 118, 18));
+        else fillrr((float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), 6, Gdiplus::Color(255, 78, 82, 94), Gdiplus::Color(255, 46, 49, 58));
+        ptext(t, r, on ? RGB(24, 18, 10) : fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        v->hits.push_back({r, kind, arg});
+    };
+    auto knobdraw = [&](float cx, float cy, float r, double val, bool act) {   // a rotary encoder: a value ring, a domed cap, a pointer
+        val = std::min(1.0, std::max(0.0, val));
+        const float rr = r + 7;
+        Gdiplus::Pen track(Gdiplus::Color(255, 20, 21, 25), 5); track.SetStartCap(Gdiplus::LineCapRound); track.SetEndCap(Gdiplus::LineCapRound);
+        pg.DrawArc(&track, cx - rr, cy - rr, 2 * rr, 2 * rr, 135.0f, 270.0f);
+        if (val > 0.002) { Gdiplus::Pen vp(act ? Gdiplus::Color(255, 255, 140, 40) : Gdiplus::Color(255, 90, 95, 108), 5); vp.SetStartCap(Gdiplus::LineCapRound); vp.SetEndCap(Gdiplus::LineCapRound); pg.DrawArc(&vp, cx - rr, cy - rr, 2 * rr, 2 * rr, 135.0f, (Gdiplus::REAL)(270.0 * val)); }
+        Gdiplus::SolidBrush shadow(Gdiplus::Color(120, 0, 0, 0)); pg.FillEllipse(&shadow, cx - r + 1, cy - r + 3, 2 * r, 2 * r);
+        Gdiplus::LinearGradientBrush body(Gdiplus::PointF(cx, cy - r), Gdiplus::PointF(cx, cy + r), Gdiplus::Color(255, 104, 108, 120), Gdiplus::Color(255, 34, 36, 42));
+        pg.FillEllipse(&body, cx - r, cy - r, 2 * r, 2 * r);
+        Gdiplus::Pen rim(Gdiplus::Color(255, 12, 13, 16), 1.5f); pg.DrawEllipse(&rim, cx - r, cy - r, 2 * r, 2 * r);
+        Gdiplus::LinearGradientBrush cap(Gdiplus::PointF(cx, cy - r * 0.75f), Gdiplus::PointF(cx, cy + r * 0.75f), Gdiplus::Color(255, 70, 74, 84), Gdiplus::Color(255, 44, 46, 54));
+        pg.FillEllipse(&cap, cx - r * 0.72f, cy - r * 0.72f, r * 1.44f, r * 1.44f);
+        const double a = (135.0 + 270.0 * val) * 3.14159265358979 / 180.0;
+        Gdiplus::Pen ptr(act ? Gdiplus::Color(255, 255, 150, 50) : Gdiplus::Color(255, 150, 155, 168), 3); ptr.SetStartCap(Gdiplus::LineCapRound); ptr.SetEndCap(Gdiplus::LineCapRound);
+        pg.DrawLine(&ptr, cx + (float)cos(a) * r * 0.30f, cy + (float)sin(a) * r * 0.30f, cx + (float)cos(a) * r * 0.74f, cy + (float)sin(a) * r * 0.74f);
+    };
+    auto plate_back = [&](int SW, int SH, int ox, int oy) {   // the panel, the bezel round the screen, the header
+        Gdiplus::LinearGradientBrush bgb(Gdiplus::Point(0, 0), Gdiplus::Point(0, VH), Gdiplus::Color(255, 47, 49, 56), Gdiplus::Color(255, 26, 28, 32));
+        pg.FillRectangle(&bgb, 0, 0, VW, VH);
+        fillrr((float)(ox - kBez), (float)(oy - kBez), (float)(SW + 2 * kBez), (float)(SH + 2 * kBez), 12, Gdiplus::Color(255, 18, 18, 21), Gdiplus::Color(255, 8, 8, 10));
+        ptext("OpenMPC Host", RECT{kPad, 8, 190, 36}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE, true);
+        const std::string pl = S.ok ? (S.pname.empty() && S.cur >= 0 && S.cur < (int)S.names.size() ? S.names[S.cur] : S.pname) : "Loading...";
+        pbtn(RECT{200, 8, 520, 36}, pl + "   \xE2\x96\xBE", H_MENU, 0, v->menu);
+        pbtn(RECT{528, 8, 640, 36}, "Manager", H_TAB, 1);
+    };
+    auto plate_front = [&](const pm::Skin* skp, int SW, int SH, int ox, int oy) {   // function keys under the screen, then the Q-Link controls
+        const int fy = oy + SH + kBez + kKeysGap, nt = skp ? (int)skp->pages.size() : 0;
+        if (nt > 0) { const int tw = SW / nt; for (int i = 0; i < nt; i++) pbtn(RECT{ox + i * tw, fy, ox + (i + 1) * tw - 6, fy + kKeysH}, skp->pages[i].name, H_SKINPAGE, i, i == v->spage); }
+        const int cy0 = fy + kKeysH + kCtlGap;
         const QSnap& q = S.q;
-        const COLORREF pbg = RGB(31, 34, 41), line = RGB(52, 56, 66);
-        const int ph = kQStripH - 8;
-        box(RECT{x, y, x + w, y + ph}, pbg);
-        box(RECT{x, y, x + w, y + 1}, line);
-        const int pad = 14, ry = y + 10;
-        int bx = x + pad;
-        text("Q-LINKS", RECT{bx, ry, bx + 62, ry + 28}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE); bx += 70;
-        button(RECT{bx, ry, bx + 34, ry + 28}, "4", H_MODE, 4, q.mode == 4); bx += 36;
-        button(RECT{bx, ry, bx + 34, ry + 28}, "8", H_MODE, 8, q.mode == 8); bx += 34 + 22;
-        text("BANK", RECT{bx, ry, bx + 42, ry + 28}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE); bx += 46;
-        if (q.nbanks <= 8) {
-            for (int b = 0; b < q.nbanks; b++) { button(RECT{bx, ry, bx + 38, ry + 28}, std::to_string(b + 1), H_BANK, b, b == q.bank); bx += 42; }
-        } else {   // a plugin without a skin map has many banks: step through them
-            button(RECT{bx, ry, bx + 30, ry + 28}, "<", H_BANKPREV, 0); bx += 34;
-            text(std::to_string(q.bank + 1) + " / " + std::to_string(q.nbanks), RECT{bx, ry, bx + 64, ry + 28}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE); bx += 68;
-            button(RECT{bx, ry, bx + 30, ry + 28}, ">", H_BANKNEXT, 0); bx += 34;
+        int bx = ox;
+        pbtn(RECT{bx, cy0, bx + 108, cy0 + 34}, "Q-LINK  \xE2\x96\xB8", H_NEXT, 0);   // the device's Q-Link button: the next bank
+        bx += 118;
+        if (q.nbanks <= 8) { for (int b = 0; b < q.nbanks; b++) { pbtn(RECT{bx, cy0, bx + 34, cy0 + 34}, std::to_string(b + 1), H_BANK, b, b == q.bank); bx += 38; } }
+        else {
+            pbtn(RECT{bx, cy0, bx + 30, cy0 + 34}, "<", H_BANKPREV, 0); bx += 34;
+            ptext(std::to_string(q.bank + 1) + " / " + std::to_string(q.nbanks), RECT{bx, cy0, bx + 60, cy0 + 34}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE); bx += 64;
+            pbtn(RECT{bx, cy0, bx + 30, cy0 + 34}, ">", H_BANKNEXT, 0);
         }
-        bx += 8;
-        button(RECT{bx, ry, bx + 76, ry + 28}, "Next \xE2\x96\xB8", H_NEXT, 0);   // the device's Q-Link button: the next bank
-        if (!q.pagename.empty()) text(q.pagename, RECT{x + w - pad - 260, ry, x + w - pad, ry + 28}, dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        const int n = q.mode, gap = 16, ix = x + pad, iw = w - 2 * pad, cw = (iw - (n - 1) * gap) / n, fy = ry + 28 + 14;
+        ptext("KNOBS", RECT{ox, cy0 + 46, ox + 60, cy0 + 74}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        pbtn(RECT{ox + 64, cy0 + 46, ox + 104, cy0 + 74}, "4", H_MODE, 4, q.mode == 4);
+        pbtn(RECT{ox + 108, cy0 + 46, ox + 148, cy0 + 74}, "8", H_MODE, 8, q.mode == 8);
+        if (!q.pagename.empty()) ptext(q.pagename, RECT{ox, cy0 + 80, ox + 290, cy0 + 100}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const int kx0 = ox + 320, n = q.mode, cw = (SW - 320) / n;
+        const float kr = n == 8 ? 20.0f : 24.0f;
         for (int k = 0; k < n; k++) {
-            const int cx = ix + k * (cw + gap), nw = cw * 6 / 10;
-            text(std::to_string(k + 1) + "  " + q.name[k], RECT{cx, fy, cx + nw, fy + 18}, q.act[k] ? fg : dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            text(q.disp[k], RECT{cx + nw, fy, cx + cw, fy + 18}, q.act[k] ? acc : dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            RECT tr{cx, fy + 24, cx + cw, fy + 36};
-            box(tr, RGB(48, 52, 62));
-            const int fw = (int)((tr.right - tr.left) * std::min(1.0, std::max(0.0, q.val[k])));
-            box(RECT{tr.left, tr.top, tr.left + fw, tr.bottom}, q.act[k] ? acc : RGB(80, 85, 98));
-            const int tx = std::min((int)tr.right - 8, std::max((int)tr.left, (int)tr.left + fw - 4));
-            box(RECT{tx, tr.top - 3, tx + 8, tr.bottom + 3}, q.act[k] ? RGB(240, 242, 246) : RGB(120, 126, 138));
-            v->hits.push_back({RECT{cx, fy - 2, cx + cw, fy + 40}, H_KNOB, k});
-            v->qtrack[k] = tr;
+            const int cx = kx0 + k * cw + cw / 2, cy = cy0 + 26;
+            knobdraw((float)cx, (float)cy, kr, q.val[k], q.act[k]);
+            ptext(std::to_string(k + 1) + "  " + q.name[k], RECT{cx - cw / 2 + 2, cy0 + 58, cx + cw / 2 - 2, cy0 + 78}, q.act[k] ? fg : dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            ptext(q.disp[k], RECT{cx - cw / 2 + 2, cy0 + 78, cx + cw / 2 - 2, cy0 + 98}, q.act[k] ? RGB(255, 150, 50) : dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            v->hits.push_back({RECT{cx - cw / 2, cy0 - 8, cx + cw / 2, cy0 + 100}, H_KNOB, k});
         }
     };
     if (v->tab == 2) {
@@ -232,13 +285,14 @@ static void paint(View* v, HDC dc, RECT cr) {
         }
         std::shared_ptr<pm::Skin> sk = v->csk; std::vector<float> pv = v->cpv; std::vector<std::string> texts = v->ctexts;
         if (sk && v->cpage_ != v->spage) sk = nullptr;   // the page changed since the snapshot: wait for a fresh one
-        if (!sk) text("No skin to show (the plugin has none, or it is still loading).", RECT{16, 60, VW, 90}, dim);
-        else {
-            int nt = (int)sk->pages.size(), tw = (VW - 32) / nt;
-            for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, VH - 34, 16 + (i + 1) * tw - 4, VH - 8}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);   // the page tabs sit under the picture
-            const int ox = 8, oy = 44;
-            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - kQStripH - 42) / (float)sk->h);
-            v->sscale = s;
+        const int SW = sk ? sk->w : 1024, SH = sk ? sk->h : 480, ox = kPad + kBez, oy = kHdr + kBez;
+        v->sox = ox; v->soy = oy;
+        plate_back(SW, SH, ox, oy);
+        if (!sk) {
+            box(RECT{ox, oy, ox + SW, oy + SH}, RGB(0, 0, 0));
+            ptext("No skin to show (the plugin has none, or it is still loading).", RECT{ox + 20, oy + 20, ox + SW - 20, oy + 50}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            const float s = 1.0f;
             auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
             auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
             Gdiplus::Graphics g(m);
@@ -282,9 +336,9 @@ static void paint(View* v, HDC dc, RECT cr) {
                 }
             }
             g.Flush();
-            qstrip(ox, oy + (int)(sk->h * s) + 6, VW - 2 * ox);
         }
-        if (!sk && S.ok) qstrip(16, 100, VW - 32);
+        plate_front(sk.get(), SW, SH, ox, oy);
+        flush_text();
     } else {
         if (lk.owns_lock()) lk.unlock();
         std::lock_guard<std::mutex> l(v->sm);
@@ -312,7 +366,8 @@ static void paint(View* v, HDC dc, RECT cr) {
         box(RECT{200, 40, 520, 42 + rows * 28 + 2}, RGB(36, 39, 46));
         for (int i = 0; i < rows; i++) button(RECT{204, 44 + i * 28, 516, 44 + i * 28 + 26}, S.names[i], H_PLUGIN, i, i == S.cur);
     }
-    BitBlt(dc, 0, 0, VW, VH, m, 0, 0, SRCCOPY);
+    if (v->vw == VW && v->vh == VH) BitBlt(dc, 0, 0, VW, VH, m, 0, 0, SRCCOPY);
+    else { SetStretchBltMode(dc, HALFTONE); SetBrushOrgEx(dc, 0, 0, nullptr); StretchBlt(dc, 0, 0, v->vw, v->vh, m, 0, 0, VW, VH, SRCCOPY); }
     DeleteObject(f); DeleteObject(fb); DeleteObject(bmp); DeleteDC(m);
     (void)cr;
 }
@@ -322,7 +377,7 @@ static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: 
     std::shared_ptr<pm::Skin> sk; std::vector<float> pv;
     { std::unique_lock<std::mutex> l(h->mu, std::try_to_lock); if (!l.owns_lock()) return; sk = h->skin; pv = h->pv; }
     if (!sk || v->spage >= (int)sk->pages.size()) return;
-    double px = (x - 8) / v->sscale, py = (y - 44) / v->sscale;
+    double px = x - v->sox, py = y - v->soy;
     auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
     auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
     const auto& items = sk->pages[v->spage].items;
@@ -338,11 +393,6 @@ static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: 
         else if (it.mode == pm::SkinItem::Drag) { v->sdrag = it.param; v->sdragy = y; v->sdragv = val(it.param); if (h->handler) h->handler->v->beginEdit(h->handler, id); }
         return;
     }
-}
-static double fader_val(View* v, int k, int x) {   // a horizontal fader: the pointer's place along its track
-    const RECT& t = v->qtrack[k];
-    double r = t.right > t.left ? (double)(x - t.left) / (t.right - t.left) : 0;
-    return r < 0 ? 0 : r > 1 ? 1 : r;
 }
 static void click(View* v, int x, int y) {
     Host* h = v->h;
@@ -373,7 +423,7 @@ static void click(View* v, int x, int y) {
                 break;
             }
             case H_NEXT: ui_edit(v, kQNext, 1, 0); ui_edit(v, kQNext, 0, 2); break;
-            case H_KNOB: { v->drag = ht.arg; if (h->handler) h->handler->v->beginEdit(h->handler, kQLink1 + ht.arg); ui_edit(v, kQLink1 + ht.arg, fader_val(v, ht.arg, x), 1); break; }
+            case H_KNOB: { v->drag = ht.arg; v->kdragy = y; v->kdragv = h->qval[ht.arg]; if (h->handler) h->handler->v->beginEdit(h->handler, kQLink1 + ht.arg); break; }
             case H_ITEM: { std::lock_guard<std::mutex> l(v->sm); v->msel = ht.arg; break; }
             case H_REFRESH: do_refresh(v); break;
             case H_INSTALL: do_install(v); break;
@@ -391,6 +441,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {   // a
 static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     View* v = (View*)GetWindowLongPtrA(w, GWLP_USERDATA);
     if (!v) return DefWindowProcA(w, msg, wp, lp);
+    const double inv = v->vw > 0 ? (double)v->lw / v->vw : 1.0;   // window pixels -> logical
+    auto LX = [&](LPARAM l) { return (int)lround((short)LOWORD(l) * inv); };
+    auto LY = [&](LPARAM l) { return (int)lround((short)HIWORD(l) * inv); };
     switch (msg) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); paint(v, dc, ps.rcPaint); EndPaint(w, &ps); return 0; }
@@ -400,14 +453,15 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             { std::unique_lock<std::mutex> l(v->h->mu, std::try_to_lock); if (l.owns_lock()) { want_size(v->h, ww, hh); l.unlock(); resize_view(v, ww, hh); } }   // the plugin was switched: another skin, another size
             InvalidateRect(w, nullptr, FALSE); return 0;
         }
-        case WM_LBUTTONDOWN: SetCapture(w); click(v, (short)LOWORD(lp), (short)HIWORD(lp)); InvalidateRect(w, nullptr, FALSE); return 0;
+        case WM_LBUTTONDOWN: SetCapture(w); click(v, LX(lp), LY(lp)); InvalidateRect(w, nullptr, FALSE); return 0;
         case WM_MOUSEMOVE:
             if (v->sdrag >= 0) {
-                double val = v->sdragv + (v->sdragy - (short)HIWORD(lp)) / 150.0;
+                double val = v->sdragv + (v->sdragy - LY(lp)) / 150.0;
                 ui_edit(v, kPluginBase + v->sdrag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
             }
             if (v->drag >= 0) {
-                ui_edit(v, kQLink1 + v->drag, fader_val(v, v->drag, (short)LOWORD(lp)), 1);
+                double val = v->kdragv + (v->kdragy - LY(lp)) / 160.0;   // a rotary knob: drag up or down
+                ui_edit(v, kQLink1 + v->drag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
             }
             return 0;
         case WM_LBUTTONUP:
@@ -416,6 +470,17 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (v->drag >= 0) { Host* h = v->h; if (h->handler) h->handler->v->endEdit(h->handler, kQLink1 + v->drag); v->drag = -1; }
             return 0;
         case WM_MOUSEWHEEL:
+            if (v->tab == 2) {   // over a Q-Link knob: nudge it
+                POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)}; ScreenToClient(w, &pt);
+                const int x = (int)lround(pt.x * inv), y = (int)lround(pt.y * inv);
+                for (int i = (int)v->hits.size() - 1; i >= 0; i--) {
+                    const Hit& ht = v->hits[i];
+                    if (ht.kind != H_KNOB || x < ht.r.left || x >= ht.r.right || y < ht.r.top || y >= ht.r.bottom) continue;
+                    double val = v->h->qval[ht.arg] + ((short)HIWORD(wp) > 0 ? 0.02 : -0.02);
+                    ui_edit(v, kQLink1 + ht.arg, val < 0 ? 0 : val > 1 ? 1 : val, 0); if (v->h->handler) v->h->handler->v->endEdit(v->h->handler, kQLink1 + ht.arg);
+                    break;
+                }
+            }
             if (v->tab == 1) { std::lock_guard<std::mutex> l(v->sm); v->mscroll += (short)HIWORD(wp) > 0 ? -2 : 2; if (v->mscroll < 0) v->mscroll = 0; if (v->mscroll > (int)v->items.size()) v->mscroll = (int)v->items.size(); }
             return 0;
     }
@@ -440,8 +505,8 @@ static tresult pv_attached(void* s, void* parent, const char* type) {
         WNDCLASSA wc{}; wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleA(nullptr); wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.lpszClassName = "OpenMPCHostView";
         RegisterClassA(&wc); reg = true;
     }
-    { std::unique_lock<std::mutex> l(v->h->mu, std::try_to_lock); if (l.owns_lock()) want_size(v->h, v->vw, v->vh); }
-    v->wnd = CreateWindowExA(0, "OpenMPCHostView", "", WS_CHILD | WS_VISIBLE, 0, 0, VW, VH, (HWND)parent, nullptr, GetModuleHandleA(nullptr), nullptr);
+    { std::unique_lock<std::mutex> l(v->h->mu, std::try_to_lock); if (l.owns_lock()) { want_size(v->h, v->lw, v->lh); double sc = fit_scale((HWND)parent, v->lw, v->lh); v->vw = (int)lround(v->lw * sc); v->vh = (int)lround(v->lh * sc); } }
+    v->wnd = CreateWindowExA(0, "OpenMPCHostView", "", WS_CHILD | WS_VISIBLE, 0, 0, v->vw, v->vh, (HWND)parent, nullptr, GetModuleHandleA(nullptr), nullptr);
     if (!v->wnd) return kResultFalse;
     SetWindowLongPtrA(v->wnd, GWLP_USERDATA, (LONG_PTR)v);
     SetTimer(v->wnd, 1, 50, nullptr);
@@ -454,19 +519,19 @@ static tresult pv_removed(void* s) {
 }
 static tresult pv_nop(void*, float) { return kResultFalse; }
 static tresult pv_key(void*, char16, int16_t, int16_t) { return kResultFalse; }
-static tresult pv_size(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); r->left = r->top = 0; r->right = VW; r->bottom = VH; return kResultOk; }
-static tresult pv_onsize(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); if (r && r->right - r->left > 0 && r->bottom - r->top > 0) { v->vw = r->right - r->left; v->vh = r->bottom - r->top; } if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, VW, VH, SWP_NOMOVE | SWP_NOZORDER); return kResultOk; }
+static tresult pv_size(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); r->left = r->top = 0; r->right = v->vw; r->bottom = v->vh; return kResultOk; }
+static tresult pv_onsize(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); if (r && r->right - r->left > 0 && r->bottom - r->top > 0) { v->vw = r->right - r->left; v->vh = r->bottom - r->top; } if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, v->vw, v->vh, SWP_NOMOVE | SWP_NOZORDER); return kResultOk; }
 static tresult pv_focus(void*, uint8_t) { return kResultOk; }
 static tresult pv_frame(void* s, void* f) { View* v = (View*)((char*)s - offsetof(View, vt)); v->frame = f; return kResultOk; }
-static tresult pv_can_resize(void*) { return kResultFalse; }
-static tresult pv_check(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); r->right = r->left + VW; r->bottom = r->top + VH; return kResultOk; }
+static tresult pv_can_resize(void*) { return kResultOk; }
+static tresult pv_check(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); { int w = r->right - r->left; if (w < v->lw / 3) w = v->lw / 3; r->right = r->left + w; r->bottom = r->top + (int)lround((double)w * v->lh / v->lw); } return kResultOk; }
 static const PlugViewVtbl pv_vtbl = {pv_query, pv_ref, pv_rel, pv_supported, pv_attached, pv_removed, pv_nop, pv_key, pv_key, pv_size, pv_onsize, pv_focus, pv_frame, pv_can_resize, pv_check};
 static void* create_view(Host* h) { View* v = new View(); v->vt = &pv_vtbl; v->h = h; h->refs++;
     bool mgr = false;
     {
         std::lock_guard<std::mutex> l(h->mu);
         if (h->skin) v->tab = 2;   // a plugin with a skin opens on it
-        want_size(h, v->vw, v->vh);
+        want_size(h, v->lw, v->lh); v->vw = v->lw; v->vh = v->lh;
         mgr = h->cur >= 0 && h->entries[h->cur].name.find("Plugin Manager") != std::string::npos;
     }
     (void)mgr;

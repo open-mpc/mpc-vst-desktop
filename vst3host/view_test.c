@@ -22,6 +22,7 @@ static const unsigned char *com(const unsigned char *b) {
     for (int i = 0; i < 16; i++) c[i] = b[map[i]];
     return c;
 }
+#define CL(x, y) MAKELPARAM((int)((x) * sc), (int)((y) * sc))
 /* audio: a DAW calls process() all the time; the hosted plugin's housekeeping (trigger spring-back, its own state) runs inside it */
 static void *g_proc, *g_comp;
 static DWORD WINAPI audio_thread(LPVOID arg) {
@@ -46,7 +47,7 @@ int main(int argc, char **argv) {
     { void *pr = 0; c->v->queryInterface(c, com(iid_IAudioProcessor), &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
     struct { const PlugViewVtbl *v; } *view = ct->v->createView(ct, "editor");
     if (!view) { printf("no view\n"); return 1; }
-    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 0, 1340, 900, 0, 0, 0, 0);
+    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 0, 1420, 960, 0, 0, 0, 0);
     ViewRect r; view->v->getSize(view, &r);
     printf("view %dx%d\n", r.right, r.bottom);
     if (view->v->attached(view, w, "HWND") != kResultOk) { printf("attach failed\n"); return 1; }
@@ -66,15 +67,29 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-mgr4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
-    if (argc > 3 && !strcmp(argv[3], "q")) {   /* the Q-Link strip: bank buttons, 8 mode, the plugin menu */
+    if (argc > 3 && !strcmp(argv[3], "q")) {   /* the faceplate: coordinates are logical (1348 wide for a 1280 skin); the window may be scaled down */
+        const double sc = r.right / 1348.0;
+        printf("window %dx%d scale %.2f\n", r.right, r.bottom, sc);
         pump(3000);
         snprintf(p, sizeof p, "%s-q4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(333, 712)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(333, 712)); pump(800);   /* bank 3 */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(245, 773)); SendMessage(v, WM_LBUTTONUP, 0, CL(245, 773)); pump(800);   /* bank 3 */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(474, 782)); for (int y = 782; y > 742; y -= 5) SendMessage(v, WM_MOUSEMOVE, 0, CL(474, y)); SendMessage(v, WM_LBUTTONUP, 0, CL(474, 742)); pump(600);   /* knob 1 up */
         snprintf(p, sizeof p, "%s-qb3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(138, 712)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(138, 712)); pump(1200);   /* 8 */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(162, 816)); SendMessage(v, WM_LBUTTONUP, 0, CL(162, 816)); pump(1200);   /* 8 */
         snprintf(p, sizeof p, "%s-q8.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(350, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(350, 20)); pump(800);   /* the plugin list */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(347, 725)); SendMessage(v, WM_LBUTTONUP, 0, CL(347, 725)); pump(2500);   /* function key: EDIT A */
+        snprintf(p, sizeof p, "%s-qe.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(360, 22)); SendMessage(v, WM_LBUTTONUP, 0, CL(360, 22)); pump(800);   /* the plugin list */
         snprintf(p, sizeof p, "%s-qm.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
+    if (argc > 3 && !strcmp(argv[3], "sc")) {   /* the host resizes the editor to 75%: it must redraw scaled and map clicks back */
+        ViewRect nr = {0, 0, 1011, 657};
+        view->v->checkSizeConstraint(view, &nr); printf("constraint -> %dx%d\n", nr.right, nr.bottom);
+        view->v->onSize(view, &nr); pump(1500);
+        const double sc = nr.right / 1348.0;
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(245, 773)); SendMessage(v, WM_LBUTTONUP, 0, CL(245, 773)); pump(800);   /* bank 3 */
+        snprintf(p, sizeof p, "%s-sc.bmp", argv[2]); shot(v, p, nr.right, nr.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
     if (argc > 3 && !strcmp(argv[3], "sw")) {   /* start on the manager's skin, then switch to the second plugin: its skin must not reuse the first one's pictures */
