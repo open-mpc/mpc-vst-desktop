@@ -197,6 +197,7 @@ static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the ho
     { auto sim = h->sim; cfg.hooks.spawn = [sim](mpchost::Guest& g, const std::vector<std::string>& a) { return sim->spawn(g, a); }; }
     if (!hp->open(so, cfg, h->load_error)) { delete hp; return false; }
     hp->start();
+    if (hp->dead()) { h->load_error = "the plugin faulted while starting: " + hp->fault(); delete hp; return false; }
     h->hp = hp; h->cur = idx;
     h->nparams = hp->num_params();
     h->pv.assign(h->nparams, 0);
@@ -217,6 +218,7 @@ static bool load(Host* h, const std::string& want = "") {   // first load: scan,
     h->entries = scan_plugins();
     std::string w = want.empty() ? default_name() : want;
     int idx = h->entries.empty() ? -1 : 0;
+    if (want.empty() && std::getenv("OPENMPC_HOST_PLUGIN")) w = "(override)";   // the developer's override wins over the default
     for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == w) { idx = i; break; }
     if (h->entries.empty()) h->load_error = "no plugins found";
     return load_index(h, idx);
@@ -242,7 +244,7 @@ static void request_reload(Host* h) {   // the stand-in MPC "restarted" (an appl
 }
 static void request_switch(Host* h, int idx) {   // from any thread; the load happens on a worker so the audio thread never waits for it (process() skips while it runs)
     logf("switch to " + std::to_string(idx) + " (now " + std::to_string(h->cur) + ", of " + std::to_string(h->entries.size()) + ")");
-    if (idx == h->cur || idx < 0 || idx >= (int)h->entries.size() || h->switching.exchange(true)) return;
+    if ((idx == h->cur && !(h->hp && h->hp->dead())) || idx < 0 || idx >= (int)h->entries.size() || h->switching.exchange(true)) return;
     h->refs++;
     std::thread([h, idx] {
         {

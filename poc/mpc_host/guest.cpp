@@ -222,13 +222,12 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     }
     void InterpreterFallback(uint64_t pc, size_t n) override {
         if (n == 1 && emulate_a64(pc)) return;
-        std::fprintf(stderr, "guest: interpreter fallback at %08llx (instruction %08x)\n", (unsigned long long)pc, rd<uint32_t>((uint32_t)pc)); std::abort();
+        char b[96]; std::snprintf(b, sizeof b, "interpreter fallback at %08llx (instruction %08x)", (unsigned long long)pc, rd<uint32_t>((uint32_t)pc)); fatal(b);
     }
     void ExceptionRaised(uint64_t pc, Dynarmic::A64::Exception e) override {
         using E = Dynarmic::A64::Exception;
         if (e == E::Yield || e == E::SendEvent || e == E::SendEventLocal || e == E::WaitForEvent || e == E::WaitForInterrupt) return;   // hints
-        std::fprintf(stderr, "guest: exception %d at %08llx\n", (int)e, (unsigned long long)pc);
-        std::abort();
+        char b[64]; std::snprintf(b, sizeof b, "exception %d at %08llx", (int)e, (unsigned long long)pc); fatal(b);
     }
     uint64_t GetCNTPCT() override { return 0; }
     // a guest that generates code (asmjit in the Osirus DSP emulator) flushes the instruction cache with `ic ivau` / `ic ialluis`: drop the translated blocks
@@ -236,19 +235,18 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         if (op == Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU) jit64->InvalidateCacheRange(value & ~63ull, 64);
         else jit64->ClearCache();
     }
-    void InterpreterFallback(uint32_t pc, size_t) override { std::fprintf(stderr, "guest: interpreter fallback at %08x\n", pc); std::abort(); }
+    void InterpreterFallback(uint32_t pc, size_t) override { char b[64]; std::snprintf(b, sizeof b, "interpreter fallback at %08x", pc); fatal(b); }
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception e) override {
         using E = Dynarmic::A32::Exception;
         if (e == E::PreloadData || e == E::PreloadDataWithIntentToWrite || e == E::PreloadInstruction || e == E::Yield ||
             e == E::SendEvent || e == E::SendEventLocal || e == E::WaitForEvent || e == E::WaitForInterrupt) return;   // hints
-        std::fprintf(stderr, "guest: exception %d at %08x\n", (int)e, pc);
-        std::abort();
+        char b[64]; std::snprintf(b, sizeof b, "exception %d at %08x", (int)e, pc); fatal(b);
     }
     void AddTicks(uint64_t) override {}
     uint64_t GetTicksRemaining() override { return 1ull << 40; }
     void CallSVC(uint32_t n) override {
         if (n == (a64 ? kRetSvc64 : kRetSvc)) { if (a64) jit64->HaltExecution(); else jit->HaltExecution(); return; }
-        if (n >= thunks.size()) { std::fprintf(stderr, "guest: bad svc %u\n", n); std::abort(); }
+        if (n >= thunks.size()) { fatal("bad svc " + std::to_string(n)); return; }
         static const bool trace = std::getenv("MPC_HOST_TRACE") != nullptr;   // every thunk call, with the guest thread
         if (trace) std::fprintf(stderr, "[t%u] %s(%x,%x,%x)\n", th.empty() ? 0 : th[cur]->id, thunk_names[n].c_str(), r(0), r(1), r(2));
         thunks[n](*this);
@@ -359,7 +357,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
         }
         if (main_active && th[0]->st != Done && th[0]->st != Run) {   // deadlock or a timed wait: the main thread gives up waiting
             GThread& t = *th[0];
-            if (t.st == WaitMutex || (t.st == WaitCond && !mutex_free(t.mtx))) { std::fprintf(stderr, "guest: deadlock (main thread waits on a held mutex)\n"); std::abort(); }
+            if (t.st == WaitMutex || (t.st == WaitCond && !mutex_free(t.mtx))) { fatal("deadlock (main thread waits on a held mutex)"); return false; }
             if (cur != 0) { save(me()); cur = 0; load(t); }
             finish_wait(t, t.timed ? 110 : 0);
             apply_ret0(t);
@@ -419,6 +417,7 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
             if (!w) break;
             cur = w; load(*th[w]); finish_wait(*th[w], 0); apply_ret0(*th[w]);
             slice_begin(); depth++; run(); depth--; slice_end();
+            if (faulted) break;
         }
         cur = 0;
         load_ctx(host_ctx);
@@ -428,10 +427,19 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     // Thunks use the armhf names: r(0..3) are the first arguments, r(13) the stack pointer, r(14) the link register; on aarch64 they read x0-x7, sp, x30.
     // An aarch64 guest keeps all addresses below 2 GB, so a 32-bit value is a whole pointer, and a sign-extended int return is also a correct long/pointer.
     void halt() { if (a64) jit64->HaltExecution(); else jit->HaltExecution(); }
+    bool faulted = false;
+    std::string fault_msg;
+    // The guest did something fatal: remember why, stop the CPU. Never abort the process (it may be a DAW); Guest::call throws GuestFault once the CPU is out of the JIT.
+    void fatal(const std::string& msg) {
+        std::fprintf(stderr, "guest: %s\n", msg.c_str());
+        if (!faulted) { faulted = true; fault_msg = msg; }
+        halt();
+    }
     // Run until the guest asks to stop (a thunk halts, or the return stub). A cache invalidation (guest-generated code flushed with `ic ivau`) also
     // makes dynarmic's Run() return: that is not a stop, so go on from where the guest was.
     void run() {
         using HR = Dynarmic::HaltReason;
+        if (faulted) return;
         for (;;) {
             const HR hr = a64 ? jit64->Run() : jit->Run();
             if ((static_cast<uint32_t>(hr) & static_cast<uint32_t>(HR::UserDefined1)) == 0 && (static_cast<uint32_t>(hr) & static_cast<uint32_t>(HR::CacheInvalidation)) != 0) continue;
@@ -647,8 +655,9 @@ void abort_named(I& i, const std::string& n) {
     static const bool lax = std::getenv("MPC_HOST_LAX") != nullptr;
     static std::unordered_map<std::string, int> seen;
     if (lax && n.find("stack smashed") == std::string::npos && n != "abort") { if (!seen[n]++) { std::fprintf(stderr, "guest: stub %s, lr=%08x\n", n.c_str(), i.r(14)); i.stubs_called.push_back(n); } i.ret(0); return; }
-    std::fprintf(stderr, "guest: called %s (not supported), lr=%08x\n", n.c_str(), i.r(14));
-    std::abort();
+    char b[160]; std::snprintf(b, sizeof b, "called %s (not supported), lr=%08x", n.c_str(), i.r(14));
+    i.fatal(b);
+    i.ret(0);
 }
 
 std::vector<Entry> libc_table() {
@@ -757,7 +766,7 @@ std::vector<Entry> libc_table() {
     add("clock_nanosleep", [](I& i) { i.ret(0); i.block(I::Sleep, 0); });
     add("poll", [](I& i) { i.ret(0); if (i.r(2) != 0) i.block(I::Sleep, 0); });
     // process
-    add("raise", [](I& i) { std::fprintf(stderr, "guest: raise(%u)\n", i.r(0)); std::abort(); });
+    add("raise", [](I& i) { i.fatal("raise(" + std::to_string(i.r(0)) + ")"); i.ret(0); });
     add("abort", [](I& i) { abort_named(i, "abort"); });
     add("__stack_chk_fail", [](I& i) { abort_named(i, "__stack_chk_fail (stack smashed)"); });
     add("__cxa_finalize", [](I&) {});
@@ -790,7 +799,7 @@ std::vector<Entry> libc_table() {
     add("isspace", [](I& i) { i.ret(std::isspace((int)i.r(0)) ? 1 : 0); });
     add("__errno_location", [](I& i) { if (!i.errno_p) i.errno_p = i.data(4, 4); i.ret(i.errno_p); });
     add("strerror", [](I& i) { i.ret(i.cstr("error")); });
-    add("__assert_fail", [](I& i) { std::fprintf(stderr, "guest: assert %s at %s:%u\n", i.str(i.r(0)), i.str(i.r(1)), i.r(2)); std::abort(); });
+    add("__assert_fail", [](I& i) { char b[256]; std::snprintf(b, sizeof b, "assert %s at %s:%u", i.str(i.r(0)), i.str(i.r(1)), i.r(2)); i.fatal(b); i.ret(0); });
     add("syscall", [](I& i) { i.ret(i.fail(38)); });   // ENOSYS: no raw system calls (a plugin using them falls back or fails)
     for (const char* n : {"pthread_cond_destroy", "pthread_cond_init", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock",
                           "pthread_rwlock_unlock", "pthread_detach", "__cxa_thread_atexit_impl"})
@@ -1254,7 +1263,7 @@ Guest::Guest(bool a64) {
     impl_->commit(0, kLoad);                                                                  // thunks, data, TLS and the first load address
     impl_->commit((a64 ? kStackTop64 : kStackTop) - 8u * 1024 * 1024, a64 ? kStackTop64 : kStackTop);   // the main stack
     // index 0: a trap at guest address 0 (a call through a null pointer, e.g. an unresolved weak import)
-    impl_->add_thunk("<null>", [](I& i) { std::fprintf(stderr, "guest: call to address 0 from lr=%08x\n", i.r(14)); std::abort(); });
+    impl_->add_thunk("<null>", [](I& i) { char b[64]; std::snprintf(b, sizeof b, "call to address 0 from lr=%08x", i.r(14)); i.fatal(b); i.ret(0); });
     impl_->wr<uint32_t>(0, a64 ? 0xD4000001u : 0xEF000000u);   // svc #0 at address 0
     impl_->th.push_back(std::make_unique<Guest::Impl::GThread>());
     impl_->th[0]->id = 1;
@@ -1308,6 +1317,7 @@ Guest::~Guest() {
 }
 
 bool Guest::is64() const { return impl_->a64; }
+bool Guest::faulted() const { return impl_->faulted; }
 bool Guest::host_path(const std::string& gp, std::string& host) { return impl_->hostpath(gp.c_str(), host); }
 const std::vector<std::string>& Guest::stubs_called() const { return impl_->stubs_called; }
 uint32_t Guest::rd32(gaddr a) const { return impl_->rd<uint32_t>(a); }
@@ -1330,7 +1340,8 @@ gaddr Guest::host_callback(HostCallback fn) {
 
 uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vector<float>& floats) {
     I& i = *impl_;
-    if (i.depth) { std::fprintf(stderr, "guest: nested call from a thunk (not supported)\n"); std::abort(); }
+    if (i.faulted) throw GuestFault(i.fault_msg);
+    if (i.depth) { i.fault_msg = "nested call from a thunk (not supported)"; i.faulted = true; std::fprintf(stderr, "guest: %s\n", i.fault_msg.c_str()); throw GuestFault(i.fault_msg); }
     if (i.a64) {   // AAPCS64: integer arguments in x0-x7 (then 8-byte stack slots), floats in v0-v7
         auto& J = *i.jit64;
         Guest::Impl::Ctx saved; i.save_ctx(saved);
@@ -1346,8 +1357,10 @@ uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vec
         i.depth++; i.run(); i.depth--;
         i.slice_end();
         i.main_active = false;
+        if (i.faulted) throw GuestFault(i.fault_msg);
         const uint64_t x0 = J.GetRegister(0); const auto v0 = J.GetVector(0);   // the result: x0, or v0 for a float/double
         i.drain();
+        if (i.faulted) throw GuestFault(i.fault_msg);
         i.load_ctx(saved);
         J.SetRegister(0, x0); J.SetVector(0, v0);
         return (uint32_t)x0;
@@ -1373,9 +1386,11 @@ uint32_t Guest::call(gaddr fn, const std::vector<uint32_t>& ints, const std::vec
     i.slice_end();
     i.depth--;
     i.main_active = false;
+    if (i.faulted) throw GuestFault(i.fault_msg);
     const uint32_t r0 = R[0];
     const uint32_t s0 = i.jit->ExtRegs()[0], s1 = i.jit->ExtRegs()[1];   // a double result lives in s0/s1
     i.drain();
+    if (i.faulted) throw GuestFault(i.fault_msg);
     i.jit->ExtRegs()[0] = s0; i.jit->ExtRegs()[1] = s1;
     R = saved;
     R[0] = r0;

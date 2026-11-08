@@ -1,0 +1,9 @@
+{
+  "name": "MPC Host Fault Test",
+  "vendor": "open-mpc",
+  "uid": "HFlT",
+  "version": 1000,
+  "so": "faulttest.so",
+  "params": "params.json",
+  "build": {"root": ".", "sources": ["engine.c"], "cflags": [], "libs": ["-lm"]}
+}

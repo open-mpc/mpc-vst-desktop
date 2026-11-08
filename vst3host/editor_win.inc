@@ -202,7 +202,8 @@ static void paint(View* v, HDC dc, RECT cr) {
             RECT qp{250, 48, VW - 16, VH - 16}; box(qp, panel);
             std::string pn = h->hp ? h->hp->name() : h->load_error;
             text(pn.empty() ? "(unnamed)" : pn, RECT{262, 54, VW - 30, 66}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, fb);
-            if (!h->switch_error.empty()) text(h->switch_error, RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (h->hp && h->hp->dead()) text("The plugin stopped: " + h->hp->fault() + ". Switch away and back to restart it.", RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            else if (!h->switch_error.empty()) text(h->switch_error, RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             text("Q-LINKS", RECT{262, 86, 400, 104}, dim);
             button(RECT{262, 108, 342, 134}, h->qmode == 4 ? "4 knobs" : "8 knobs", H_MODE, 0);
             button(RECT{352, 108, 382, 134}, "<", H_BANKPREV, 0);

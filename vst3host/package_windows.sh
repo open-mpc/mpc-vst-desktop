@@ -25,11 +25,11 @@ cp -r "$PM" "$STAGE/Contents/Resources/plugins/$PMNAME"
 printf '%s\n' "$PMNAME" > "$STAGE/Contents/Resources/default.txt"
 cp "$REPO/LICENSE" "$TOP/licenses/mpc-vst-desktop-LICENSE.txt"
 cp "$ARM_DOC/copyright" "$TOP/licenses/guestlibs-armv7-copyright.txt"; cp "$A64_DOC/copyright" "$TOP/licenses/guestlibs-aarch64-copyright.txt"
-cp "$HERE/package/README.txt" "$HERE/package/THIRD_PARTY.txt" "$TOP/"
+cp "$HERE/package/README.txt" "$HERE/package/THIRD_PARTY.txt" "$HERE/package/install.bat" "$HERE/package/uninstall.bat" "$TOP/"
 python3 - "$TOP" "$VERSION" <<'PY'
 import sys,os
 top,ver=sys.argv[1:3]
-for f in ['README.txt','THIRD_PARTY.txt']:   # Windows line endings
+for f in ['README.txt','THIRD_PARTY.txt','install.bat','uninstall.bat']:   # Windows line endings
     p=os.path.join(top,f); d=open(p,newline='').read().replace('@VERSION@',ver).replace('\r\n','\n').replace('\n','\r\n'); open(p,'w',newline='').write(d)
 PY
 mkdir -p "$REPO/dist"; rm -f "$REPO/dist/$NAME.zip"

@@ -59,7 +59,12 @@ struct HostedPlugin::Impl {
     int o_proc() const { return a64 ? 120 : 80; }
     uint32_t ps() const { return a64 ? 8 : 4; }
     void wrp(gaddr a, uint32_t v) { g->wr32(a, v); if (a64) g->wr32(a + 4, 0); }
-    uint32_t dispatch(int32_t op, int32_t idx, int32_t val, uint32_t ptr, float opt) { return g->call(disp, {eff, (uint32_t)op, (uint32_t)idx, (uint32_t)val, ptr}, {opt}); }
+    bool dead = false;            // the guest faulted (an unsupported call, a CPU fault, abort): it never runs again, the host process carries on
+    std::string fault;
+    void kill(const char* m) { dead = true; fault = m; }
+    uint32_t callg(gaddr fn, const std::vector<uint32_t>& a, const std::vector<float>& f = {}) { if (dead) return 0; try { return g->call(fn, a, f); } catch (const GuestFault& e) { kill(e.what()); return 0; } }
+    float callf(gaddr fn, const std::vector<uint32_t>& a) { if (dead) return 0; try { return g->call_f(fn, a); } catch (const GuestFault& e) { kill(e.what()); return 0; } }
+    uint32_t dispatch(int32_t op, int32_t idx, int32_t val, uint32_t ptr, float opt) { return callg(disp, {eff, (uint32_t)op, (uint32_t)idx, (uint32_t)val, ptr}, {opt}); }
     std::string text(int op, int idx) {
         const gaddr b = g->alloc(256); std::memset(g->host(b), 0, 256);
         dispatch(op, idx, 0, b, 0);
@@ -128,7 +133,7 @@ bool HostedPlugin::open(const std::string& path, const Config& cfg, std::string&
     std::memset(t, 0, sizeof *t);
     t->sampleRate = kRate; t->tempo = 120; t->num = 4; t->den = 4; t->flags = (1 << 10) | (1 << 9);
     { std::lock_guard<std::mutex> l(g_map_mu); g_by_guest[&g] = &p; }
-    p.eff = g.call(main, {g.host_callback(guest_master)});
+    try { p.eff = g.call(main, {g.host_callback(guest_master)}); } catch (const GuestFault& e) { p.kill(e.what()); error = std::string("the plugin faulted while starting: ") + e.what(); return false; }
     if (!p.eff || g.rd32(p.eff) != 0x56737450) { error = "VSTPluginMain returned no AEffect"; return false; }
     p.disp = g.rd32(p.eff + p.o_disp());
     p.proc = g.rd32(p.eff + p.o_proc());
@@ -152,8 +157,8 @@ int HostedPlugin::num_programs() const { return (int32_t)impl_->g->rd32(impl_->e
 std::string HostedPlugin::param_name(int i) { return impl_->text(effGetParamName, i); }
 std::string HostedPlugin::param_label(int i) { return impl_->text(effGetParamLabel, i); }
 std::string HostedPlugin::param_display(int i) { return impl_->text(effGetParamDisplay, i); }
-void HostedPlugin::set_param(int i, float v) { Impl& p = *impl_; p.g->call(p.g->rd32(p.eff + p.o_setp()), {p.eff, (uint32_t)i}, {v}); }
-float HostedPlugin::get_param(int i) { Impl& p = *impl_; return p.g->call_f(p.g->rd32(p.eff + p.o_getp()), {p.eff, (uint32_t)i}); }
+void HostedPlugin::set_param(int i, float v) { Impl& p = *impl_; p.callg(p.g->rd32(p.eff + p.o_setp()), {p.eff, (uint32_t)i}, {v}); }
+float HostedPlugin::get_param(int i) { Impl& p = *impl_; return p.callf(p.g->rd32(p.eff + p.o_getp()), {p.eff, (uint32_t)i}); }
 
 void HostedPlugin::midi(uint8_t status, uint8_t d1, uint8_t d2, int delta_frames) {
     Impl& p = *impl_;
@@ -173,7 +178,8 @@ void HostedPlugin::set_transport(double tempo, double ppq, bool playing) {
 void HostedPlugin::process(float* l, float* r) {
     Impl& p = *impl_; Guest& g = *p.g;
     if (p.nev) { g.wr32(p.evs, p.nev); g.wr32(p.evs + 4, 0); if (p.a64) { g.wr32(p.evs + 8, 0); g.wr32(p.evs + 12, 0); } p.dispatch(effProcessEvents, 0, 0, p.evs, 0); p.nev = 0; }
-    g.call(p.proc, {p.eff, p.ins, p.outs, (uint32_t)kBlock});
+    p.callg(p.proc, {p.eff, p.ins, p.outs, (uint32_t)kBlock});
+    if (p.dead) { std::memset(l, 0, kBlock * 4); std::memset(r, 0, kBlock * 4); return; }   // a dead guest is silent
     std::memcpy(l, g.host(p.buf_l), kBlock * 4);
     std::memcpy(r, g.host(p.buf_r), kBlock * 4);
     g.ptr<GuestTime>(p.time)->samplePos += kBlock;
@@ -198,6 +204,8 @@ bool HostedPlugin::set_chunk(const std::vector<uint8_t>& c) {
     return ok;
 }
 
+bool HostedPlugin::dead() const { return impl_->dead; }
+std::string HostedPlugin::fault() const { return impl_->fault; }
 std::vector<std::pair<int, float>> HostedPlugin::take_automation() { std::vector<std::pair<int, float>> v; v.swap(impl_->automation); return v; }
 bool HostedPlugin::take_display_dirty() { const bool d = impl_->display_dirty; impl_->display_dirty = false; return d; }
 

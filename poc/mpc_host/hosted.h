@@ -51,6 +51,8 @@ public:
     std::vector<std::pair<int, float>> take_automation();
     bool take_display_dirty();
 
+    bool dead() const;                          // the guest faulted and was stopped; calls return zeros and process() is silent
+    std::string fault() const;
     Guest& guest();                             // for stats and tests
     struct Impl;
 private:

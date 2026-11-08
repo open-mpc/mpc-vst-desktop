@@ -3,12 +3,16 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace mpchost {
 
 using gaddr = uint32_t;   // a guest (32-bit ARM) address
+
+// Thrown by Guest::call when the guest did something it cannot be allowed to (an unsupported libc call, a CPU fault, abort, a failed assert): the guest is stopped for good, the host process is not.
+struct GuestFault : std::runtime_error { using std::runtime_error::runtime_error; };
 
 class Guest {
 public:
@@ -17,6 +21,7 @@ public:
     // Loads the .so, applies relocations and runs its constructors. False on error (see error()).
     bool load(const std::string& path);
     bool is64() const;
+    bool faulted() const;   // the guest has stopped after a fault (see GuestFault)
     const std::vector<std::string>& stubs_called() const;   // unsupported imports called so far (needs MPC_HOST_LAX=1 set before the first call)
     const std::string& error() const { return err_; }
     const std::vector<std::string>& missing() const { return missing_; }   // imports with no thunk (called = abort)

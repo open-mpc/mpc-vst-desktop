@@ -9,8 +9,13 @@ What this is
   works too: it runs on a simulated MPC, so Discover, Install, Apply ("Restart MPC" only restarts the manager here) behave as on the device.
 
 Install
-  1. Copy the folder "OpenMPC Host.vst3" to  C:\Program Files\Common Files\VST3\   (or any folder your DAW scans).
+  1. Double-click install.bat (it copies "OpenMPC Host.vst3" to C:\Program Files\Common Files\VST3\ and asks for administrator
+     rights), or copy that folder there / to any folder your DAW scans yourself. uninstall.bat removes it again.
   2. Rescan plugins in your DAW. Add "OpenMPC Host" as an instrument.
+  Ableton Live (11 or 12, 64-bit, Windows): Preferences > Plug-ins > turn on "Use VST3 System Folders" (or point a custom
+  folder at the one above) > Rescan. Then Plug-ins > VST3 > OpenMPC Host; drag it onto a MIDI track. Click the wrench (Configure)
+  to put parameters on Live's generic panel: Q-Link 1-8 and Q-Link Bank / Next Bank / Page come first, then the plugin's own.
+  Hold the plugin's window open to use the skin; Live's own device view shows only Live's generic controls for it.
   Needs 64-bit Windows 10 or 11 and a 64-bit DAW. Nothing else is installed. Delete the folder to remove it.
 
 Using it
