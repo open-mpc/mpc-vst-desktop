@@ -20,7 +20,7 @@ cp -L "$A64_LIBDIR/libgcc_s.so.1" "$A64_LIBDIR/libstdc++.so.6" "$STAGE/Contents/
 # the Plugin Manager the host opens on: the released aarch64 build from the catalog (MIT)
 W=$(mktemp -d); g++ -std=c++20 -O1 "$HERE/installer.cpp" "$HERE/pm_cli.cpp" -ldl -o "$W/pm_cli"
 "$W/pm_cli" install plugin-manager-g2 "$W/root"
-PM=$(ls -d "$W/root/sdcard/Synths/"*/ | head -n 1); PMNAME=$(basename "$PM")
+PM=$(ls -d "$W/root/nvme/Synths/"*/ | head -n 1); PMNAME=$(basename "$PM")
 cp -r "$PM" "$STAGE/Contents/Resources/plugins/$PMNAME"
 printf '%s\n' "$PMNAME" > "$STAGE/Contents/Resources/default.txt"
 cp "$REPO/LICENSE" "$TOP/licenses/mpc-vst-desktop-LICENSE.txt"
