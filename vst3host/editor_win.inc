@@ -253,7 +253,7 @@ static void paint(View* v, HDC dc, RECT cr) {
             if (curkey >= 0 && keys[curkey].size() > 1) {
                 const int ns = (int)keys[curkey].size(), tw = std::min(190, SW / ns);
                 for (int j = 0; j < ns; j++) {
-                    const RECT r{ox + j * tw, fy, ox + (j + 1) * tw - 4, fy + kSubH - 6};
+                    const RECT r{ox + j * tw, fy + kKeysH + 4, ox + (j + 1) * tw - 4, fy + kKeysH + kSubH - 4};
                     const bool on = keys[curkey][j] == cur;
                     fillrr((float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), 5, on ? Gdiplus::Color(255, 58, 62, 74) : Gdiplus::Color(255, 36, 38, 45), on ? Gdiplus::Color(255, 44, 47, 57) : Gdiplus::Color(255, 30, 32, 38));
                     if (on) { Gdiplus::SolidBrush ab(Gdiplus::Color(255, 255, 140, 40)); pg.FillRectangle(&ab, r.left + 6, r.bottom - 3, r.right - r.left - 12, 2); }
@@ -261,7 +261,6 @@ static void paint(View* v, HDC dc, RECT cr) {
                     v->hits.push_back({r, H_SKINPAGE, keys[curkey][j]});
                 }
             }
-            fy += kSubH;
         }
         const int nk = (int)keys.size();
         if (nk > 0) {   // the function keys: one per key of the device; pressing the lit one again steps to its next sub-page
@@ -272,7 +271,7 @@ static void paint(View* v, HDC dc, RECT cr) {
                 pbtn(RECT{ox + i * tw, fy, ox + (i + 1) * tw - 6, fy + kKeysH}, skp->pages[keys[i][0]].name, H_SKINPAGE, target, i == curkey);
             }
         }
-        const int cy0 = fy + kKeysH + kCtlGap;
+        const int cy0 = fy + kKeysH + (any_sub ? kSubH : 0) + kCtlGap;
         const QSnap& q = S.q;
         int bx = ox;
         pbtn(RECT{bx, cy0, bx + 108, cy0 + 34}, "Q-LINK  \xE2\x96\xB8", H_NEXT, 0);   // the device's Q-Link button: the next bank

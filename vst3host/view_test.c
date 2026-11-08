@@ -87,11 +87,11 @@ int main(int argc, char **argv) {
         const double sc = r.right / 1348.0;
         pump(3000);
         snprintf(p, sizeof p, "%s-k0.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, CL(507, 720)); SendMessage(v, WM_LBUTTONUP, 0, CL(507, 720)); pump(2500);   /* sub tab 3: SNARE */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(507, 755)); SendMessage(v, WM_LBUTTONUP, 0, CL(507, 755)); pump(2500);   /* sub tab 3: SNARE */
         snprintf(p, sizeof p, "%s-k1.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 755)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 755)); pump(2500);   /* key 2: HT - CH */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 725)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 725)); pump(2500);   /* key 2: HT - CH */
         snprintf(p, sizeof p, "%s-k2.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 755)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 755)); pump(2500);   /* again: next sub-page */
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 725)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 725)); pump(2500);   /* again: next sub-page */
         snprintf(p, sizeof p, "%s-k3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
