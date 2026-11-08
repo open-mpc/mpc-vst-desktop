@@ -1,5 +1,6 @@
 #include "skin.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -67,6 +68,8 @@ bool load_skin(const std::string& dir, Skin& sk, std::string& err) {
         }
         SkinPage out;
         out.name = tab.str("tabName");
+        if (const J* k = num(tab, "fnKeyIndex")) out.fk = (int)k->n; else out.fk = (int)sk.pages.size();
+        if (const J* k = num(tab, "fnKeySubIndex")) out.fs = (int)k->n;
         const J* comps = page->get("componentsData");
         if (comps && comps->t == J::Arr) for (const J& c : comps->a) {
             const J* cdat = c.get("componentData");
@@ -148,6 +151,20 @@ bool load_skin(const std::string& dir, Skin& sk, std::string& err) {
         sk.pages.push_back(std::move(out));
     }
     return !sk.pages.empty();
+}
+
+std::vector<std::vector<int>> skin_keys(const Skin& s) {
+    std::vector<std::vector<int>> keys;
+    std::vector<int> ids;
+    for (auto& p : s.pages) if (std::find(ids.begin(), ids.end(), p.fk) == ids.end()) ids.push_back(p.fk);
+    std::sort(ids.begin(), ids.end());
+    for (int id : ids) {
+        std::vector<int> pg;
+        for (int i = 0; i < (int)s.pages.size(); i++) if (s.pages[i].fk == id) pg.push_back(i);
+        std::stable_sort(pg.begin(), pg.end(), [&](int a, int b) { return s.pages[a].fs < s.pages[b].fs; });
+        keys.push_back(pg);
+    }
+    return keys;
 }
 
 }  // namespace pm

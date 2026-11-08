@@ -20,6 +20,7 @@ struct Hit { RECT r; int kind, arg; };
 struct QSnap { int mode = 4, bank = 0, nbanks = 1, page = 0, npages = 0; std::string pagename; double val[8] = {}; bool act[8] = {}; std::string name[8], disp[8]; };
 struct TabSnap { bool ok = false; std::vector<std::string> names; int cur = -1; std::string pname, err; QSnap q; };   // what the generic tabs draw: taken under the emulator lock, drawn without it
 // The faceplate (logical pixels): header, the screen in a bezel, a row of function keys, a control row (Q-Link button, banks, knobs). The window is this scaled to fit.
+static const int kSubH = 30;   // the sub-page row under the screen
 static const int kHdr = 44, kPad = 20, kBez = 14, kKeysGap = 10, kKeysH = 30, kCtlGap = 16, kCtlH = 100, kBot = 20;
 static const int kExtraH = kHdr + kBez + kBez + kKeysGap + kKeysH + kCtlGap + kCtlH + kBot;   // everything but the screen
 struct View {
@@ -139,7 +140,9 @@ static void take_snap(View* v, Host* h) {   // the emulator lock is held: a few 
 // The window the hosted plugin's skin wants: its native pixels (a 1280x628 page) plus our header (44) and page tabs (42), never smaller than the generic tabs.
 static void want_size(Host* h, int& w, int& hh) {
     const int sw = h->skin ? h->skin->w : 1024, sh = h->skin ? h->skin->h : 480;   // a plugin without a skin gets a blank screen
-    w = std::max(kMinW, sw + 2 * (kPad + kBez)); hh = std::max(kMinH, sh + kExtraH);
+    int sub = 0;
+    if (h->skin) for (auto& k : pm::skin_keys(*h->skin)) if (k.size() > 1) sub = kSubH;   // a row of sub-page tabs, when any function key holds several pages
+    w = std::max(kMinW, sw + 2 * (kPad + kBez)); hh = std::max(kMinH, sh + kExtraH + sub);
 }
 // The window size for a logical size: 1:1 when it fits the screen the host window is on, else scaled down (never below 40%).
 static double fit_scale(HWND any, int lw, int lh) {
@@ -238,8 +241,37 @@ static void paint(View* v, HDC dc, RECT cr) {
         pbtn(RECT{528, 8, 640, 36}, "Manager", H_TAB, 1);
     };
     auto plate_front = [&](const pm::Skin* skp, int SW, int SH, int ox, int oy) {   // function keys under the screen, then the Q-Link controls
-        const int fy = oy + SH + kBez + kKeysGap, nt = skp ? (int)skp->pages.size() : 0;
-        if (nt > 0) { const int tw = SW / nt; for (int i = 0; i < nt; i++) pbtn(RECT{ox + i * tw, fy, ox + (i + 1) * tw - 6, fy + kKeysH}, skp->pages[i].name, H_SKINPAGE, i, i == v->spage); }
+        int fy = oy + SH + kBez + kKeysGap;
+        std::vector<std::vector<int>> keys;
+        if (skp) keys = pm::skin_keys(*skp);
+        bool any_sub = false;
+        for (auto& k : keys) any_sub = any_sub || k.size() > 1;
+        const int cur = skp && v->spage < (int)skp->pages.size() ? v->spage : 0;
+        int curkey = -1;
+        for (int i = 0; i < (int)keys.size(); i++) for (int pi : keys[i]) if (pi == cur) curkey = i;
+        if (any_sub) {   // the sub-pages of the key in use, as small tabs; blank for a key with one page
+            if (curkey >= 0 && keys[curkey].size() > 1) {
+                const int ns = (int)keys[curkey].size(), tw = std::min(190, SW / ns);
+                for (int j = 0; j < ns; j++) {
+                    const RECT r{ox + j * tw, fy, ox + (j + 1) * tw - 4, fy + kSubH - 6};
+                    const bool on = keys[curkey][j] == cur;
+                    fillrr((float)r.left, (float)r.top, (float)(r.right - r.left), (float)(r.bottom - r.top), 5, on ? Gdiplus::Color(255, 58, 62, 74) : Gdiplus::Color(255, 36, 38, 45), on ? Gdiplus::Color(255, 44, 47, 57) : Gdiplus::Color(255, 30, 32, 38));
+                    if (on) { Gdiplus::SolidBrush ab(Gdiplus::Color(255, 255, 140, 40)); pg.FillRectangle(&ab, r.left + 6, r.bottom - 3, r.right - r.left - 12, 2); }
+                    ptext(skp->pages[keys[curkey][j]].name, r, on ? fg : dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    v->hits.push_back({r, H_SKINPAGE, keys[curkey][j]});
+                }
+            }
+            fy += kSubH;
+        }
+        const int nk = (int)keys.size();
+        if (nk > 0) {   // the function keys: one per key of the device; pressing the lit one again steps to its next sub-page
+            const int tw = SW / nk;
+            for (int i = 0; i < nk; i++) {
+                int target = keys[i][0];
+                if (i == curkey) { size_t at = std::find(keys[i].begin(), keys[i].end(), cur) - keys[i].begin(); target = keys[i][(at + 1) % keys[i].size()]; }
+                pbtn(RECT{ox + i * tw, fy, ox + (i + 1) * tw - 6, fy + kKeysH}, skp->pages[keys[i][0]].name, H_SKINPAGE, target, i == curkey);
+            }
+        }
         const int cy0 = fy + kKeysH + kCtlGap;
         const QSnap& q = S.q;
         int bx = ox;
@@ -404,10 +436,12 @@ static void click(View* v, int x, int y) {
             case H_MENU: v->menu = !v->menu; break;
             case H_MENUCLOSE: v->menu = false; break;
             case H_BANK: ui_edit(v, kQBank, ht.arg / 15.0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kQBank); break;
-            case H_SKINPAGE: {   // the skin's tab also picks the matching Q-Link page, as on the device
+            case H_SKINPAGE: {   // the skin's page: the Q-Links follow it, as on the device
                 v->spage = ht.arg;
-                int np = (int)h->pages.size();
-                for (int j = 0; j < np; j++) if (h->pages[j].tab == ht.arg + 1 && h->pages[j].sub == 1) { ui_edit(v, kPage, np > 1 ? j / (double)(np - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kPage); break; }
+                int fk = -1, fs = 0;
+                { std::lock_guard<std::mutex> l(h->mu); if (h->skin && ht.arg < (int)h->skin->pages.size()) { fk = h->skin->pages[ht.arg].fk; fs = h->skin->pages[ht.arg].fs; } }
+                const int np = (int)h->pages.size();
+                for (int j = 0; j < np && fk >= 0; j++) if (h->pages[j].tab == fk + 1 && h->pages[j].sub == fs + 1) { ui_edit(v, kPage, np > 1 ? j / (double)(np - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, kPage); break; }
                 break;
             }
             case H_PLUGIN: { v->menu = false; std::lock_guard<std::mutex> l(h->mu); request_switch(h, ht.arg); break; }

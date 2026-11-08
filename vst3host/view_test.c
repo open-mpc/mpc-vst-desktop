@@ -83,6 +83,18 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-qm.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
+    if (argc > 3 && !strcmp(argv[3], "k")) {   /* function keys with sub-pages (a 4-key skin with 14 pages) */
+        const double sc = r.right / 1348.0;
+        pump(3000);
+        snprintf(p, sizeof p, "%s-k0.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(507, 720)); SendMessage(v, WM_LBUTTONUP, 0, CL(507, 720)); pump(2500);   /* sub tab 3: SNARE */
+        snprintf(p, sizeof p, "%s-k1.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 755)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 755)); pump(2500);   /* key 2: HT - CH */
+        snprintf(p, sizeof p, "%s-k2.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(511, 755)); SendMessage(v, WM_LBUTTONUP, 0, CL(511, 755)); pump(2500);   /* again: next sub-page */
+        snprintf(p, sizeof p, "%s-k3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
     if (argc > 3 && !strcmp(argv[3], "sc")) {   /* the host resizes the editor to 75%: it must redraw scaled and map clicks back */
         ViewRect nr = {0, 0, 1011, 657};
         view->v->checkSizeConstraint(view, &nr); printf("constraint -> %dx%d\n", nr.right, nr.bottom);

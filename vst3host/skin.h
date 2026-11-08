@@ -19,8 +19,11 @@ struct SkinItem {
     struct Cond { int param, option, count; };             // shown while parameter `param` is at option `option` of `count`
     std::vector<Cond> cond;
 };
-struct SkinPage { std::string name; std::vector<SkinItem> items; };
+struct SkinPage { std::string name; int fk = 0, fs = 0; std::vector<SkinItem> items; };   // fk, fs: the function key and the sub-page under it (the device has six keys; a key can hold several pages)
 struct Skin { std::string dir; int w = 1280, h = 628; std::vector<SkinPage> pages; };
+
+// Page indices by function key, in key order, each in sub-page order.
+std::vector<std::vector<int>> skin_keys(const Skin& s);
 
 bool load_skin(const std::string& skin_dir, Skin& out, std::string& err);   // <skin_dir>/TUI.json
 
