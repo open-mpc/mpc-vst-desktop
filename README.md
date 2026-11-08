@@ -6,7 +6,7 @@ MPC OS plugins on a desktop DAW. Two methods, one repo:
 |---|---|---|
 | **Rebuild as VST3** | Build a port from [mpc-vst-plugins](https://github.com/open-mpc/mpc-vst-plugins) source as a VST3, with its MPC skin as the plugin window | Linux: loads in Reaper (2026-10-30). Windows: cross-built, tested under Wine only. See [docs/DESKTOP_VST3.md](docs/DESKTOP_VST3.md) |
 | **Host released plugins** | Run the released armv7/aarch64 `.so` unchanged, under an ARM JIT (dynarmic) inside a VST3 | Emulator: armv7 and aarch64 guests, Linux and Windows, `--check` verdicts ([docs/MPC_HOST.md](docs/MPC_HOST.md)) |
-| **OpenMPC Host (the hosted VST3)** | One VST3 that hosts one MPC plugin at a time and switches between them: the plugin's own skin at native size, Q-Link section (4 or 8 knobs, banks, skin pages), the stock Plugin Manager running on a simulated MPC | Windows x64: tested natively with scripted clicks (2026-11-08), not yet in a DAW (Ableton Live next). Design [docs/MPC_VST3_HOST.md](docs/MPC_VST3_HOST.md), handoff [docs/HANDOFF_VST3_HOST.md](docs/HANDOFF_VST3_HOST.md) |
+| **OpenMPC Host (the hosted VST3)** | One VST3 that hosts one MPC plugin at a time and switches between them: the plugin's own skin at native size, Q-Link section (4 or 8 knobs, banks, skin pages), the stock Plugin Manager running on a simulated MPC | Windows x64: tested natively with scripted clicks (2026-11-08), not yet in a DAW (Ableton Live next). **[Download the Windows preview](https://github.com/open-mpc/mpc-vst-desktop/releases/tag/vst3-v0.1.0-preview)**. Design [docs/MPC_VST3_HOST.md](docs/MPC_VST3_HOST.md), handoff [docs/HANDOFF_VST3_HOST.md](docs/HANDOFF_VST3_HOST.md) |
 
 Goal: Windows and macOS first-class for both.
 
