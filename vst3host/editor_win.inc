@@ -419,6 +419,7 @@ static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: 
         for (auto& c : it.cond) shown = shown && opt(c.param, c.count) == c.option;
         if (!shown || it.param < 0) continue;
         uint32_t id = kPluginBase + it.param;
+        if (std::getenv("OPENMPC_HOST_LOGCLICK")) logf("skin click " + std::to_string((int)px) + "," + std::to_string((int)py) + " param " + std::to_string(it.param) + " mode " + std::to_string((int)it.mode) + " id " + std::to_string(it.id) + "/" + std::to_string(it.n) + " value " + std::to_string(val(it.param)));
         if (it.mode == pm::SkinItem::Radio) { ui_edit(v, id, it.n > 1 ? (double)it.id / (it.n - 1) : 0, 0); if (h->handler) h->handler->v->endEdit(h->handler, id); }
         else if (it.mode == pm::SkinItem::Toggle) { ui_edit(v, id, val(it.param) > 0.5f ? 0 : 1, 0); if (h->handler) h->handler->v->endEdit(h->handler, id); }
         else if (it.mode == pm::SkinItem::Drag) { v->sdrag = it.param; v->sdragy = y; v->sdragv = val(it.param); if (h->handler) h->handler->v->beginEdit(h->handler, id); }

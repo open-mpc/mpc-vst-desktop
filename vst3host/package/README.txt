@@ -38,6 +38,6 @@ Where things are
 Limits of this test build
   - Emulation costs CPU: light plugins are fine, heavy ones (JV-880 ~50% of real time, Osirus more than 100%) are not usable.
   - About a third of plugins do not restore every setting from a saved project; some need files or services the host does not provide.
-  - A page's pictures load the first time it is shown (about a second). Dropdown lists in a skin, the mouse wheel, and resizing do
-    not work yet. No macOS or Linux build in this package.
+  - A page's pictures load the first time it is shown (about a second). Holding a momentary button, and the PC keyboard, do not
+    work yet. No macOS or Linux build in this package.
   - Not yet tested in every DAW. Please report the DAW and what happened.

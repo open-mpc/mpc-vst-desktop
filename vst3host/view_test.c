@@ -95,6 +95,16 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-k3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
+    if (argc > 3 && !strcmp(argv[3], "pd")) {   /* a skin dropdown (Acid's REGEN): open it, pick an option */
+        const double sc = r.right / 1348.0;
+        pump(3000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(1085, 297)); SendMessage(v, WM_LBUTTONUP, 0, CL(1085, 297)); pump(1500);
+        snprintf(p, sizeof p, "%s-pd1.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, CL(1090, 436)); SendMessage(v, WM_LBUTTONUP, 0, CL(1090, 436)); pump(400); snprintf(p, sizeof p, "%s-pd2a.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        pump(800); snprintf(p, sizeof p, "%s-pd2b.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        pump(1500); snprintf(p, sizeof p, "%s-pd2c.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
     if (argc > 3 && !strcmp(argv[3], "sc")) {   /* the host resizes the editor to 75%: it must redraw scaled and map clicks back */
         ViewRect nr = {0, 0, 1011, 657};
         view->v->checkSizeConstraint(view, &nr); printf("constraint -> %dx%d\n", nr.right, nr.bottom);
