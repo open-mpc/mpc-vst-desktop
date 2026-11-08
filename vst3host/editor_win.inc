@@ -386,5 +386,11 @@ static tresult pv_can_resize(void*) { return kResultFalse; }
 static tresult pv_check(void*, ViewRect* r) { r->right = r->left + VW; r->bottom = r->top + VH; return kResultOk; }
 static const PlugViewVtbl pv_vtbl = {pv_query, pv_ref, pv_rel, pv_supported, pv_attached, pv_removed, pv_nop, pv_key, pv_key, pv_size, pv_onsize, pv_focus, pv_frame, pv_can_resize, pv_check};
 static void* create_view(Host* h) { View* v = new View(); v->vt = &pv_vtbl; v->h = h; h->refs++;
-    { std::lock_guard<std::mutex> l(h->mu); if (h->skin) v->tab = 2; }
+    bool mgr = false;
+    {
+        std::lock_guard<std::mutex> l(h->mu);
+        if (h->skin) v->tab = 2;   // a plugin with a skin opens on it
+        mgr = h->cur >= 0 && h->entries[h->cur].name.find("Plugin Manager") != std::string::npos;
+    }
+    if (mgr) { v->tab = 1; do_refresh(v); }   // the stock manager cannot install on a desktop: open our own Manager tab, catalog loaded
     return &v->vt; }
