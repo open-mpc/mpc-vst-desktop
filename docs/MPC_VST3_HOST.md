@@ -107,6 +107,8 @@ Still to decide (see below): which hosts the curl shim may reach, and whether sw
 
 **Native skin size (2026-11-08, native Windows):** the editor window follows the hosted plugin's skin: skin pixels 1:1 (a 1280x628 page gives a 1296x714 window: 8 px margins, a 44 px header, a 42 px page-tab strip), never smaller than 960x560 for the generic tabs. On a plugin switch (a different skin size) the editor asks the host with `IPlugFrame::resizeView` and resizes its window; `onSize` is honoured. The skin tab draws from the last snapshot when the emulator is busy, so it no longer blanks while audio runs. Not done: scaling down for small screens or up for high DPI (`canResize` is false).
 
+**First real DAW run, Ableton Live 12.4.1 on Windows (2026-11-08): the plugin could not be opened.** Live's `Log.txt` (`%APPDATA%\Ableton\Live 12.4.1\Preferences\Log.txt`) said `VST3: plugin processor could not be loaded using factory by 'OpenMPC'`. Cause: on Windows the VST3 SDK passes interface IDs in the COM layout (the first three GUID fields little-endian), while `vst3_abi.h` writes them big-endian (the Linux layout) and our own test hosts used the same header, so `createInstance` never matched. Fix: `iid_eq` swaps bytes 0-7 on `_WIN32`; `view_test.c` now passes COM-order IDs like a DAW. **The same applies to the source-built Windows VST3 (`wrapper/vst3_wrap.c` in mpc-vst-plugins), which has only been run under Wine/its own test host.** Live's log is the first place to look for any further failure.
+
 **Not started:** M6 (Linux editor, CI).
 
 **Where M1 began (done):**

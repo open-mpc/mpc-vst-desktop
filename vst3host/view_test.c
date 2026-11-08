@@ -14,6 +14,14 @@ static void shot(HWND w, const char *path, int cw, int ch) {
     FILE *f = fopen(path, "wb"); fwrite(&fh, sizeof fh, 1, f); fwrite(&bi, sizeof bi, 1, f); fwrite(px, row, ch, f); fclose(f);
     free(px); DeleteDC(m); DeleteObject(b); ReleaseDC(w, dc);
 }
+/* On Windows a host passes interface IDs in the COM layout (the first three GUID fields little-endian): swap vst3_abi.h's plain big-endian ones as a DAW would. */
+static const unsigned char *com(const unsigned char *b) {
+    static unsigned char t[8][16]; static int n;
+    static const int map[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+    unsigned char *c = t[n++ & 7];
+    for (int i = 0; i < 16; i++) c[i] = b[map[i]];
+    return c;
+}
 /* audio: a DAW calls process() all the time; the hosted plugin's housekeeping (trigger spring-back, its own state) runs inside it */
 static void *g_proc, *g_comp;
 static DWORD WINAPI audio_thread(LPVOID arg) {
@@ -31,11 +39,11 @@ int main(int argc, char **argv) {
     if (!lib) { printf("load failed %lu\n", GetLastError()); return 1; }
     const FactoryVtbl **(*gf)(void) = (void *)GetProcAddress(lib, "GetPluginFactory");
     const FactoryVtbl **f = gf(); PClassInfo ci; (*f)->getClassInfo(f, 0, &ci);
-    void *obj = 0; (*f)->createInstance(f, (const char *)ci.cid, (const char *)iid_IComponent, &obj);
+    void *obj = 0; (*f)->createInstance(f, (const char *)ci.cid, (const char *)com(iid_IComponent), &obj);
     struct { const ComponentVtbl *v; } *c = obj; c->v->initialize(c, 0);
-    void *ctl = 0; c->v->queryInterface(c, iid_IEditController, &ctl);
+    void *ctl = 0; c->v->queryInterface(c, com(iid_IEditController), &ctl);
     struct { const ControllerVtbl *v; } *ct = ctl;
-    { void *pr = 0; c->v->queryInterface(c, iid_IAudioProcessor, &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
+    { void *pr = 0; c->v->queryInterface(c, com(iid_IAudioProcessor), &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
     struct { const PlugViewVtbl *v; } *view = ct->v->createView(ct, "editor");
     if (!view) { printf("no view\n"); return 1; }
     HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 1340, 800, 0, 0, 0, 0);

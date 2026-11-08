@@ -267,7 +267,18 @@ static void rs_reset(Host* h) {
 }
 
 // ---- IUnknown ---------------------------------------------------------------------------------------------------------
-static bool iid_eq(const void* a, const TUID b) { return !memcmp(a, b, 16); }
+// vst3_abi.h writes the interface IDs in plain big-endian order (the Linux layout). On Windows the VST3 SDK uses the COM layout: the first three
+// GUID fields are little-endian (4 + 2 + 2 bytes), so a host's IID differs in bytes 0-7. Our own class ID is compared as written.
+static bool iid_eq(const void* a, const TUID b) {
+#ifdef _WIN32
+    TUID c;
+    static const int map[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+    for (int i = 0; i < 16; i++) c[i] = b[map[i]];
+    return !memcmp(a, c, 16);
+#else
+    return !memcmp(a, b, 16);
+#endif
+}
 static tresult query(Host* h, const uint8_t* iid, void** obj) {
     if (iid_eq(iid, iid_FUnknown) || iid_eq(iid, iid_IComponent) || iid_eq(iid, iid_IPluginBase)) *obj = &h->comp;
     else if (iid_eq(iid, iid_IAudioProcessor)) *obj = &h->proc;
