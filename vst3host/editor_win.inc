@@ -27,11 +27,12 @@ struct View {
     int vw = kMinW, vh = kMinH;   // the window's size in pixels
     std::shared_ptr<pm::Skin> csk; std::vector<float> cpv; std::vector<std::string> ctexts; int cpage_ = -1;   // the last snapshot of the skin page: drawn when the emulator is busy
     int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0; float sscale = 1;   // the skin tab: page, drag, scale
-    std::map<std::string, Gdiplus::Bitmap*> bmps;
+    std::map<std::string, Gdiplus::Bitmap*> bmps; std::string bmps_dir;   // the picture cache is for one plugin's skin folder; file names repeat between plugins (sh_bg_0.png)
     ~View() { for (auto& kv : bmps) delete kv.second; }
 };
 static Gdiplus::Bitmap* skin_image(View* v, const std::string& dir, const std::string& name) {
     if (name.empty()) return nullptr;
+    if (v->bmps_dir != dir) { for (auto& kv : v->bmps) delete kv.second; v->bmps.clear(); v->bmps_dir = dir; }
     auto it = v->bmps.find(name);
     if (it != v->bmps.end()) return it->second;
     std::wstring w = W(dir + "/" + name);

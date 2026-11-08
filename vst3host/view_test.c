@@ -66,6 +66,14 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-mgr4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
+    if (argc > 3 && !strcmp(argv[3], "sw")) {   /* start on the manager's skin, then switch to the second plugin: its skin must not reuse the first one's pictures */
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(485, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(485, 20)); pump(4000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(380, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(380, 20)); pump(1000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(100, 108)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(100, 108)); pump(8000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(485, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(485, 20)); pump(5000);
+        snprintf(p, sizeof p, "%s-sw.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
     if (argc > 3 && !strcmp(argv[3], "mgr")) {   /* the stock manager's own screen on the Skin tab */
         SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(485, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(485, 20)); pump(15000);
         snprintf(p, sizeof p, "%s-mgr.bmp", argv[2]); shot(v, p, r.right, r.bottom);
