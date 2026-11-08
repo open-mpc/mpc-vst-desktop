@@ -80,6 +80,7 @@ static void do_install(View* v) {
             int idx = -1;
             {
                 std::lock_guard<std::mutex> l(h->mu);
+                if (h->sim) h->sim->write_settings();
                 std::string keep = h->cur >= 0 ? h->entries[h->cur].name : "";
                 h->entries = scan_plugins();
                 for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == folder) idx = i;
@@ -127,6 +128,12 @@ static void paint(View* v, HDC dc, RECT cr) {
         if (lk.owns_lock()) {   // a snapshot, so the emulator is not held while drawing
             sk = h->skin; pv = h->pv;
             if (sk && v->spage >= (int)sk->pages.size()) v->spage = 0;
+            if (sk) {   // the processor reads these back from the plugin, so buttons it resets itself show as off
+                std::vector<int> w;
+                for (auto& it : sk->pages[v->spage].items) { if (it.param >= 0) w.push_back(it.param); for (auto& c : it.cond) w.push_back(c.param); }
+                std::sort(w.begin(), w.end()); w.erase(std::unique(w.begin(), w.end()), w.end());
+                h->watch = std::move(w);
+            }
             if (sk) for (auto& it : sk->pages[v->spage].items) {
                 std::string t;
                 if (it.kind == pm::SkinItem::Label) { if (it.name) t = it.text; else if (it.param >= 0 && it.param < h->nparams && h->hp) t = h->hp->param_display(it.param); }

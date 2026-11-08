@@ -107,6 +107,7 @@ bool HostedPlugin::open(const std::string& path, const Config& cfg, std::string&
     }
     p.g.reset(new Guest(p.a64));
     Guest& g = *p.g;
+    g.hooks = cfg.hooks;
     const std::string sup = cfg.support_dir.empty() ? exe_dir() : cfg.support_dir;
     auto load = [&](const std::string& f) { if (!g.load(f)) { error = "load " + f + ": " + g.error(); return false; } return true; };
     const std::string helpers = sup + (p.a64 ? "/guest_helpers64.so" : "/guest_helpers.so");

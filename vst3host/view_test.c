@@ -14,6 +14,17 @@ static void shot(HWND w, const char *path, int cw, int ch) {
     FILE *f = fopen(path, "wb"); fwrite(&fh, sizeof fh, 1, f); fwrite(&bi, sizeof bi, 1, f); fwrite(px, row, ch, f); fclose(f);
     free(px); DeleteDC(m); DeleteObject(b); ReleaseDC(w, dc);
 }
+/* audio: a DAW calls process() all the time; the hosted plugin's housekeeping (trigger spring-back, its own state) runs inside it */
+static void *g_proc, *g_comp;
+static DWORD WINAPI audio_thread(LPVOID arg) {
+    (void)arg;
+    struct { const ProcessorVtbl *v; } *p = g_proc;
+    float L[512], R[512], *ch[2] = {L, R};
+    AudioBusBuffers ob = {2, 0, ch};
+    ProcessData pd = {0, 0, 512, 0, 1, 0, &ob, 0, 0, 0, 0, 0};
+    for (;;) { p->v->process(p, &pd); Sleep(10); }
+    return 0;
+}
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     HMODULE lib = LoadLibraryA(argv[1]);
@@ -24,6 +35,7 @@ int main(int argc, char **argv) {
     struct { const ComponentVtbl *v; } *c = obj; c->v->initialize(c, 0);
     void *ctl = 0; c->v->queryInterface(c, iid_IEditController, &ctl);
     struct { const ControllerVtbl *v; } *ct = ctl;
+    { void *pr = 0; c->v->queryInterface(c, iid_IAudioProcessor, &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
     struct { const PlugViewVtbl *v; } *view = ct->v->createView(ct, "editor");
     if (!view) { printf("no view\n"); return 1; }
     HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 1000, 640, 0, 0, 0, 0);
@@ -33,6 +45,24 @@ int main(int argc, char **argv) {
     char p[512];
     pump(3000); snprintf(p, sizeof p, "%s-plugin.bmp", argv[2]); shot(GetWindow(w, GW_CHILD), p, r.right, r.bottom);
     HWND v = GetWindow(w, GW_CHILD);
+    if (argc > 3 && !strcmp(argv[3], "mgr2")) {   /* the manager's own install: INSTALL Keyscope, APPLY twice, wait for the restart */
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(485, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(485, 20)); pump(12000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(840, 228)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(840, 228)); pump(2000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(853, 480)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(853, 480)); pump(15000);
+        snprintf(p, sizeof p, "%s-mgr2a.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(853, 480)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(853, 480)); pump(20000);
+        snprintf(p, sizeof p, "%s-mgr2.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(853, 480)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(853, 480)); pump(8000);
+        snprintf(p, sizeof p, "%s-mgr3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(590, 412)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(590, 412)); pump(15000);   /* RESTART & APPLY in the prompt */
+        snprintf(p, sizeof p, "%s-mgr4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
+    if (argc > 3 && !strcmp(argv[3], "mgr")) {   /* the stock manager's own screen on the Skin tab */
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(485, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(485, 20)); pump(15000);
+        snprintf(p, sizeof p, "%s-mgr.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
     if (argc > 3 && !strcmp(argv[3], "skin")) {   /* DIR: REV, then drag the Density knob up, then page EDIT A */
         SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(785, 295)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(785, 295)); pump(300);
         SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(103, 286)); for (int y = 286; y > 238; y -= 4) SendMessage(v, WM_MOUSEMOVE, 0, MAKELPARAM(103, y)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(103, 238)); pump(600);

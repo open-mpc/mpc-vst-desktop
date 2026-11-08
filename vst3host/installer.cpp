@@ -157,6 +157,50 @@ uint32_t u16(const uint8_t* p) { return p[0] | p[1] << 8; }
 uint32_t u32(const uint8_t* p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 }  // namespace
 
+bool zip_list(const std::vector<uint8_t>& z, std::vector<ZipEntry>& out, std::string& err) {
+    out.clear();
+    if (z.size() < 22) { err = "not a zip"; return false; }
+    size_t e = z.size() - 22;
+    while (e > 0 && u32(&z[e]) != 0x06054b50) { if (z.size() - e > 70000) { err = "not a zip"; return false; } e--; }
+    if (u32(&z[e]) != 0x06054b50) { err = "not a zip"; return false; }
+    unsigned count = u16(&z[e + 10]);
+    size_t pos = u32(&z[e + 16]);
+    for (unsigned i = 0; i < count; i++) {
+        if (pos + 46 > z.size() || u32(&z[pos]) != 0x02014b50) { err = "damaged zip"; return false; }
+        unsigned nl = u16(&z[pos + 28]), xl = u16(&z[pos + 30]), cl = u16(&z[pos + 32]);
+        if (pos + 46 + nl > z.size()) { err = "damaged zip"; return false; }
+        out.push_back({std::string((const char*)&z[pos + 46], nl), u32(&z[pos + 24])});
+        pos += 46 + nl + xl + cl;
+    }
+    return true;
+}
+bool zip_read(const std::vector<uint8_t>& z, const std::string& name, std::vector<uint8_t>& out, std::string& err) {
+    // reuse unzip(): extract just this entry into a scratch folder is heavier than reading it here, so walk the central directory again
+    size_t e = z.size() < 22 ? 0 : z.size() - 22;
+    while (e > 0 && u32(&z[e]) != 0x06054b50) e--;
+    if (z.size() < 22 || u32(&z[e]) != 0x06054b50) { err = "not a zip"; return false; }
+    unsigned count = u16(&z[e + 10]);
+    size_t pos = u32(&z[e + 16]);
+    for (unsigned i = 0; i < count && pos + 46 <= z.size(); i++) {
+        unsigned method = u16(&z[pos + 10]), nl = u16(&z[pos + 28]), xl = u16(&z[pos + 30]), cl = u16(&z[pos + 32]);
+        uint64_t csize = u32(&z[pos + 20]), usize = u32(&z[pos + 24]);
+        size_t lho = u32(&z[pos + 42]);
+        std::string n((const char*)&z[pos + 46], nl);
+        pos += 46 + nl + xl + cl;
+        if (n != name) continue;
+        if (lho + 30 > z.size() || u32(&z[lho]) != 0x04034b50) { err = "damaged zip"; return false; }
+        size_t data = lho + 30 + u16(&z[lho + 26]) + u16(&z[lho + 28]);
+        if (data + csize > z.size() || usize > (64u << 20)) { err = "damaged zip"; return false; }
+        out.clear();
+        if (method == 0) out.assign(z.begin() + data, z.begin() + data + csize);
+        else if (method == 8) { if (!inflate(&z[data], csize, out) || out.size() != usize) { err = "cannot inflate " + name; return false; } }
+        else { err = "unsupported compression"; return false; }
+        return true;
+    }
+    err = "no such entry: " + name;
+    return false;
+}
+
 bool unzip(const std::vector<uint8_t>& z, const std::string& dest, const std::string& strip, std::string& err) {
     if (z.size() < 22) { err = "not a zip"; return false; }
     size_t e = z.size() - 22;
@@ -353,7 +397,7 @@ bool install(const Item& it, const std::string& root, std::string& folder, std::
     }
     if (src.empty()) { err = "the package has no portable/<folder>"; fs::remove_all(tmp, ec); return false; }
     folder = src.filename().string();
-    fs::path dst = fs::path(root) / "sdcard" / "Synths" / folder;
+    fs::path dst = fs::path(root) / "nvme" / "Synths" / folder;
     fs::create_directories(dst.parent_path(), ec);
     fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);   // files the user added in the folder stay
     std::error_code ec2;

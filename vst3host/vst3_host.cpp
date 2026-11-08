@@ -26,6 +26,7 @@
 #include "../poc/mpc_host/hosted.h"
 #include "installer.h"
 #include "skin.h"
+#include "devicesim.h"
 #include <memory>
 
 using mpchost::HostedPlugin;
@@ -99,7 +100,8 @@ static std::vector<Entry> scan_plugins() {
         }
     };
     add(module_dir() + "/../Resources/plugins");
-    add(user_dir() + "/sdcard/Synths");
+    add(user_dir() + "/" + pm::DeviceSim::kSynths);
+    add(user_dir() + "/sdcard/Synths");   // installs made by earlier builds
     std::sort(v.begin(), v.end(), [](const Entry& a, const Entry& b) { const std::string def = default_name(); bool pa = a.name == def, pb = b.name == def; return pa != pb ? pa : a.name < b.name; });
     if (const char* e = std::getenv("OPENMPC_HOST_PLUGIN")) v.insert(v.begin(), Entry{"(override)", e});
     return v;
@@ -125,6 +127,8 @@ struct Host {
     IComponentHandler* handler = nullptr;
     int nparams = 0;
     std::vector<float> pv;            // the host's view of each hosted parameter
+    std::shared_ptr<pm::DeviceSim> sim;   // the stand-in MPC the hosted Plugin Manager runs on
+    std::vector<int> watch; int watch_tick = 0;   // parameters the editor shows: read back from the plugin now and then (it changes some by itself)
     std::string skin_dir;
     std::shared_ptr<pm::Skin> skin;   // the hosted plugin's skin (null: none)
     std::vector<pm::QPage> pages; int qpage = 0;   // the skin's Q-Link sets
@@ -140,6 +144,7 @@ struct Host {
 };
 #define FROM(p, m) ((Host*)((char*)(p) - offsetof(Host, m)))
 
+static void request_reload(Host* h);
 static int nbanks(Host* h) {
     if (!h->pages.empty()) return 16 / h->qmode;   // 4 knobs: a bank is one column of the 4x4 grid (4 banks), 8 knobs: two columns (2 banks)
     int n = (h->nparams + h->qmode - 1) / h->qmode; return n < 1 ? 1 : n > 16 ? 16 : n;
@@ -185,6 +190,11 @@ static bool load_index(Host* h, int idx) {   // callers hold mu: replaces the ho
     HostedPlugin::Config cfg;
     cfg.root = user_dir();
     cfg.support_dir = module_dir() + "/../Resources";
+    if (!h->sim) { h->sim = std::make_shared<pm::DeviceSim>(); h->sim->root = user_dir(); }
+    h->sim->setup();
+    h->sim->on_restart = [h] { request_reload(h); };
+    cfg.hooks.http_get = [](const std::string& u, std::vector<uint8_t>& b, std::string& e) { return pm::http_get(u, b, e); };
+    { auto sim = h->sim; cfg.hooks.spawn = [sim](mpchost::Guest& g, const std::vector<std::string>& a) { return sim->spawn(g, a); }; }
     if (!hp->open(so, cfg, h->load_error)) { delete hp; return false; }
     hp->start();
     h->hp = hp; h->cur = idx;
@@ -212,6 +222,24 @@ static bool load(Host* h, const std::string& want = "") {   // first load: scan,
     return load_index(h, idx);
 }
 static uint32_t release(Host* h);
+static void request_reload(Host* h);
+static void request_reload(Host* h) {   // the stand-in MPC "restarted" (an apply): start the hosted plugin afresh and rescan, once the current call has returned
+    if (h->switching.exchange(true)) return;
+    h->refs++;
+    std::thread([h] {
+        {
+            std::lock_guard<std::mutex> l(h->mu);
+            std::string keep = h->cur >= 0 ? h->entries[h->cur].name : "";
+            h->entries = scan_plugins();
+            int idx = 0;
+            for (int i = 0; i < (int)h->entries.size(); i++) if (h->entries[i].name == keep) idx = i;
+            load_index(h, idx);
+        }
+        h->switching = false;
+        if (h->handler) h->handler->v->restartComponent(h->handler, 1 | 4);
+        release(h);
+    }).detach();
+}
 static void request_switch(Host* h, int idx) {   // from any thread; the load happens on a worker so the audio thread never waits for it (process() skips while it runs)
     logf("switch to " + std::to_string(idx) + " (now " + std::to_string(h->cur) + ", of " + std::to_string(h->entries.size()) + ")");
     if (idx == h->cur || idx < 0 || idx >= (int)h->entries.size() || h->switching.exchange(true)) return;
@@ -455,7 +483,13 @@ static tresult proc_process(void* s, ProcessData* d) {
     if (ol && h->bypass) { memset(ol, 0, n * 4); memset(orr, 0, n * 4); }
     if (ol) d->outputs[0].silenceFlags = 0;
     // changes the plugin made itself go back to the host
-    for (auto& a : h->hp->take_automation()) {
+    auto changes = h->hp->take_automation();
+    if (++h->watch_tick >= 8) {   // about every 23 ms
+        h->watch_tick = 0;
+        if (h->hp->take_display_dirty() || !h->watch.empty())
+            for (int p : h->watch) { if (p < 0 || p >= h->nparams) continue; float v = h->hp->get_param(p); if (std::fabs(v - h->pv[p]) > 1e-6f) changes.emplace_back(p, v); }
+    }
+    for (auto& a : changes) {
         if (a.first < 0 || a.first >= h->nparams) continue;
         h->pv[a.first] = a.second;
         for (int k = 0; k < h->qmode; k++) if (qparam(h, k) == a.first) h->qval[k] = a.second;

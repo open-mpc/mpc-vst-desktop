@@ -1,4 +1,4 @@
-// The host-native plugin manager service (docs/MPC_VST3_HOST.md, M3): catalog, download, sha256, unzip, install into <root>/sdcard/Synths/<name>/.
+// The host-native plugin manager service (docs/MPC_VST3_HOST.md, M3): catalog, download, sha256, unzip, install into <root>/nvme/Synths/<name>/.
 // No external libraries: a small JSON reader, SHA-256, inflate and zip reader here; HTTPS through WinHTTP (Windows) or the system libcurl (Linux, dlopen).
 #pragma once
 #include <cstdint>
@@ -15,6 +15,10 @@ struct Item {
 bool http_get(const std::string& url, std::vector<uint8_t>& out, std::string& err);   // https://..., http://..., file://path or a plain path
 std::string sha256_hex(const uint8_t* p, size_t n);
 bool unzip(const std::vector<uint8_t>& zip, const std::string& dest, const std::string& strip_prefix, std::string& err);   // entries under strip_prefix go to dest
+
+struct ZipEntry { std::string name; uint64_t size = 0; };
+bool zip_list(const std::vector<uint8_t>& zip, std::vector<ZipEntry>& out, std::string& err);                          // every entry, as `unzip -l` lists them
+bool zip_read(const std::vector<uint8_t>& zip, const std::string& name, std::vector<uint8_t>& out, std::string& err);   // one entry's contents
 
 // catalog.json -> the downloadable items for `arch` ("aarch64" or "armv7"; falls back to the other when a plugin has only one)
 bool load_catalog(const std::string& url, const std::string& arch, std::vector<Item>& items, std::string& err);

@@ -2,6 +2,7 @@
 // One guest: a 4 GB address space, one dynarmic A32 CPU, one plugin. Single-threaded.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,14 @@ public:
     // The guest's view of the VST host callback: a guest function pointer that runs `fn` on the host.
     using HostCallback = uint32_t (*)(Guest&, uint32_t eff, int32_t op, int32_t idx, int32_t val, uint32_t ptr, float opt);
     gaddr host_callback(HostCallback fn);
+
+    // Services the embedding host may lend a guest (the VST3 gives the Plugin Manager a device to run on): HTTP GET for a libcurl lookalike, and what
+    // posix_spawn runs (the argument vector; the exit status). Unset: libcurl is not found and spawning fails, as for any sandboxed guest.
+    struct Hooks {
+        std::function<bool(const std::string& url, std::vector<uint8_t>& body, std::string& error)> http_get;
+        std::function<int(Guest&, const std::vector<std::string>& argv)> spawn;
+    } hooks;
+    bool host_path(const std::string& guest_path, std::string& host);   // where a guest path lives on the host (MPC_HOST_ROOT, /plugin/)
 
     struct Impl;
 private:

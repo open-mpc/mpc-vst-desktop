@@ -100,6 +100,9 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<std::string> stubs_called;   // unsupported imports the guest actually called (MPC_HOST_LAX only; otherwise the first one aborts)
     gaddr errno_p = 0, clocale = 0;
     // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
+    std::map<int, std::pair<std::vector<uint8_t>, size_t>> http;   // the lent HTTP GETs: body and read position
+    int next_http = 1, next_pid = 2000;
+    std::map<int, int> exits;   // pid -> exit status of the lent spawns
     std::unordered_map<gaddr, FILE*> files;
     std::unordered_map<gaddr, hostfs::Dir> dirs;
     std::string plugin_dir;
@@ -675,6 +678,28 @@ std::vector<Entry> libc_table() {
     add("strrchr", [](I& i) { const char* p = std::strrchr(i.str(i.r(0)), (int)i.r(1)); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
     add("strstr", [](I& i) { const char* p = std::strstr(i.str(i.r(0)), i.str(i.r(1))); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
     auto strtol_ = [](I& i) { char* e; const long v = std::strtol(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); if (i.a64) i.ret64((uint64_t)v); else i.ret((uint32_t)(int32_t)v); };
+    auto strtoll_ = [](I& i) { char* e; const long long v = std::strtoll(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret64((uint64_t)v); };
+    auto strtoull_ = [](I& i) { char* e; const unsigned long long v = std::strtoull(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); i.ret64((uint64_t)v); };
+    add("strtoll", strtoll_); add("__isoc23_strtoll", strtoll_); add("strtoull", strtoull_); add("__isoc23_strtoull", strtoull_);
+    add("strncasecmp", [](I& i) { i.ret((uint32_t)::strncasecmp(i.str(i.r(0)), i.str(i.r(1)), i.r(2))); });
+    add("strncat", [](I& i) { std::strncat(i.str(i.r(0)), i.str(i.r(1)), i.r(2)); i.ret(i.r(0)); });
+    add("strpbrk", [](I& i) { const char* p = std::strpbrk(i.str(i.r(0)), i.str(i.r(1))); i.ret(p ? (uint32_t)(reinterpret_cast<const uint8_t*>(p) - i.m) : 0); });
+    add("fsync", [](I& i) { i.ret(0); });
+    add("localtime_r", [](I& i) {   // UTC (no time zone database): struct tm { nine ints, gmtoff, zone }
+        const int64_t t = i.a64 ? (int64_t)i.rd<int64_t>(i.r(0)) : (int64_t)i.rd<int32_t>(i.r(0));
+        const std::time_t tt = (std::time_t)t; std::tm out{};
+#ifdef _WIN32
+        gmtime_s(&out, &tt);
+#else
+        gmtime_r(&tt, &out);
+#endif
+        const int v[9] = {out.tm_sec, out.tm_min, out.tm_hour, out.tm_mday, out.tm_mon, out.tm_year, out.tm_wday, out.tm_yday, 0};
+        std::memset(i.m + i.r(1), 0, i.a64 ? 56 : 44);
+        std::memcpy(i.m + i.r(1), v, sizeof v);
+        i.ret(i.r(1)); });
+    for (const char* n : {"accept4", "accept", "bind", "listen", "setsockopt", "getifaddrs"}) add(n, [](I& i) { i.ret(i.fail(97)); });   // EAFNOSUPPORT: no sockets for guests (the manager's local web page just stays off)
+    add("freeifaddrs", [](I& i) { i.ret(0); });
+    add("inet_ntop", [](I& i) { i.ret(0); });
     add("strtol", strtol_);
     add("__isoc23_strtol", strtol_);
     add("strtoul", [](I& i) { char* e; const unsigned long v = std::strtoul(i.str(i.r(0)), &e, (int)i.r(2)); if (i.r(1)) i.wrp(i.r(1), (uint32_t)(reinterpret_cast<uint8_t*>(e) - i.m)); if (i.a64) i.ret64((uint64_t)v); else i.ret((uint32_t)v); });
@@ -860,7 +885,58 @@ std::vector<Entry> libc_table() {
     add("fma", [](I& i) { i.ret_d(std::fma(i.d(0), i.d(1), i.d(2))); });
     add("fmaf", [](I& i) { i.ret_f(std::fma(i.s(0), i.s(1), i.s(2))); });
     add("localtime", [](I& i) { i.ret(0); });   // callers log timestamps: a NULL result is allowed by the C standard
-    for (const char* n : {"dlopen", "dlsym", "dlerror"}) add(n, [](I& i) { i.ret(0); });
+    // dlopen: only a libcurl lookalike, and only when the embedding host lends HTTP (the shim is guest code in guest_helpers.c; see curl_easy_* there)
+    add("dlopen", [](I& i) { const std::string n = i.r(0) ? i.str(i.r(0)) : ""; i.ret(n.find("libcurl") != std::string::npos && i.g.hooks.http_get ? 1 : 0); });
+    add("dlsym", [](I& i) { i.ret(i.r(0) == 1 && i.r(1) ? i.g.symbol(i.str(i.r(1))) : 0); });
+    add("dlerror", [](I& i) { i.ret(0); });
+    add("__mpc_http_open", [](I& i) {   // (url, from): the whole body is fetched now; a handle, or -1
+        std::vector<uint8_t> body; std::string err;
+        if (!i.g.hooks.http_get || !i.g.hooks.http_get(i.str(i.r(0)), body, err)) { i.ret(0xFFFFFFFFu); return; }
+        const int h = i.next_http++;
+        size_t from = i.r(1);
+        i.http[h] = {std::move(body), from};
+        i.ret((uint32_t)h); });
+    add("__mpc_http_total", [](I& i) { auto it = i.http.find((int)i.r(0)); i.ret(it == i.http.end() ? 0 : (uint32_t)it->second.first.size()); });
+    add("__mpc_http_read", [](I& i) {   // (handle, buf, n) -> bytes
+        auto it = i.http.find((int)i.r(0));
+        if (it == i.http.end()) { i.ret(0); return; }
+        auto& b = it->second;
+        const size_t n = b.second >= b.first.size() ? 0 : std::min<size_t>(i.r(2), b.first.size() - b.second);
+        if (n) std::memcpy(i.m + i.r(1), b.first.data() + b.second, n);
+        b.second += n;
+        i.ret((uint32_t)n); });
+    add("__mpc_http_close", [](I& i) { i.http.erase((int)i.r(0)); i.ret(0); });
+    // posix_spawn(p): the argument vector goes to the embedding host's spawn hook, which runs it now; waitpid hands back the status
+    for (const char* n : {"posix_spawn", "posix_spawnp"}) add(n, [](I& i) {
+        if (!i.g.hooks.spawn) { i.ret(38); return; }   // ENOSYS (posix_spawn returns the error number)
+        std::vector<std::string> argv;
+        const uint32_t ps = i.a64 ? 8 : 4;
+        for (uint32_t a = i.r(4); a && argv.size() < 64; a += ps) { const uint32_t sp = i.rdp(a); if (!sp) break; argv.push_back(i.str(sp)); }
+        if (argv.empty()) argv.push_back(i.r(1) ? i.str(i.r(1)) : "");
+        const int status = i.g.hooks.spawn(i.g, argv);
+        const int pid = i.next_pid++;
+        i.exits[pid] = status;
+        if (i.r(0)) i.wr<int32_t>(i.r(0), pid);
+        i.ret(status == -1000 ? 2u : 0u); });   // -1000: no such program (ENOENT)
+    add("waitpid", [](I& i) {
+        auto it = i.exits.find((int)i.r(0));
+        if (it == i.exits.end()) { i.ret(i.fail(10)); return; }   // ECHILD
+        if (i.r(1)) i.wr<int32_t>(i.r(1), (it->second & 0xff) << 8);
+        const int pid = it->first; i.exits.erase(it); i.ret((uint32_t)pid); });
+    // statvfs: plenty of free space on every path that exists (the guest's "disk" is the host's folder)
+    for (const char* n : {"statvfs", "statvfs64"}) add(n, [](I& i) {
+        std::string hp;
+        if (!i.hostpath(i.str(i.r(0)), hp) || !std::filesystem::exists(hp)) { i.ret(i.fail(2)); return; }
+        if (i.a64) {
+            std::memset(i.m + i.r(1), 0, 112);
+            const uint64_t v[11] = {4096, 4096, 1ull << 24, 1ull << 23, 1ull << 23, 1ull << 20, 1ull << 19, 1ull << 19, 0, 0, 255};
+            std::memcpy(i.m + i.r(1), v, sizeof v);
+        } else {   // armhf statvfs: eleven 32-bit fields
+            std::memset(i.m + i.r(1), 0, 44);
+            const uint32_t v[11] = {4096, 4096, 1u << 22, 1u << 21, 1u << 21, 1u << 20, 1u << 19, 1u << 19, 0, 0, 255};
+            std::memcpy(i.m + i.r(1), v, sizeof v);
+        }
+        i.ret(0); });
     for (const char* n : {"sigaction", "pthread_attr_init", "pthread_attr_destroy", "pthread_attr_setschedpolicy", "pthread_attr_setschedparam",
                           "pthread_attr_setinheritsched", "pthread_setname_np", "pthread_setaffinity_np", "sched_setaffinity", "pthread_setschedparam"})
         add(n, [](I& i) { i.ret(0); });
@@ -1052,9 +1128,9 @@ std::vector<Entry> libc_table() {
     for (const char* n : {"bindtextdomain", "bind_textdomain_codeset", "textdomain"}) add(n, [](I& i) { i.ret(0); });
     add("arc4random", [](I& i) { i.ret((uint32_t)std::rand()); });
     add("getentropy", [](I& i) { for (uint32_t k = 0; k < i.r(1); k++) i.m[i.r(0) + k] = (uint8_t)std::rand(); i.ret(0); });
-    for (const char* n : {"ftruncate", "ftruncate64", "writev", "ioctl", "waitpid", "iconv_open", "shm_open", "shm_unlink", "posix_spawn", "unlink", "fdopen", "fileno"})
+    for (const char* n : {"ftruncate", "ftruncate64", "writev", "ioctl", "iconv_open", "shm_open", "shm_unlink", "unlink", "fdopen", "fileno"})
         add(n, [](I& i) { i.ret(i.fail(38)); });   // ENOSYS
-    for (const char* n : {"posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy", "posix_spawn_file_actions_addopen", "iconv_close"}) add(n, [](I& i) { i.ret(0); });
+    for (const char* n : {"posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy", "posix_spawn_file_actions_addopen", "posix_spawn_file_actions_adddup2", "iconv_close"}) add(n, [](I& i) { i.ret(0); });
     // glibc 2.35+: struct dl_find_object { u64 flags; void *map_start, *map_end, *link_map, *eh_frame; ... } (aarch64 layout); libgcc's unwinder uses it
     add("_dl_find_object", [](I& i) {
         static const bool off = std::getenv("MPC_HOST_NO_DLFO") != nullptr;   // test switch: make the unwinder fall back to dl_iterate_phdr
@@ -1083,7 +1159,7 @@ std::vector<Entry> libc_table() {
         const char* v[5] = {"Linux", "mpc", "5.15.0", "#1", i.a64 ? "aarch64" : "armv7l"};
         for (int k = 0; k < 5; k++) std::strcpy((char*)i.m + i.r(0) + 65 * k, v[k]);
         i.ret(0); });
-    for (const char* n : {"readlink", "statvfs", "statvfs64", "statfs", "statfs64", "fstatvfs", "realpath"}) add(n, [](I& i) { i.ret(i.fail(2)); });   // no symlinks, no filesystem statistics
+    for (const char* n : {"readlink", "statfs", "statfs64", "fstatvfs", "realpath"}) add(n, [](I& i) { i.ret(i.fail(2)); });   // no symlinks, no filesystem statistics
 #define ISW(n) add(#n, [](I& i) { i.ret(i.r(0) < 128 && std::n((wint_t)i.r(0)) ? 1 : 0); });   // wide-character classes: ASCII only (the "C" locale)
     ISW(iswspace) ISW(iswalpha) ISW(iswdigit) ISW(iswalnum) ISW(iswupper) ISW(iswlower) ISW(iswpunct) ISW(iswprint) ISW(iswcntrl) ISW(iswxdigit)
 #undef ISW
@@ -1232,6 +1308,7 @@ Guest::~Guest() {
 }
 
 bool Guest::is64() const { return impl_->a64; }
+bool Guest::host_path(const std::string& gp, std::string& host) { return impl_->hostpath(gp.c_str(), host); }
 const std::vector<std::string>& Guest::stubs_called() const { return impl_->stubs_called; }
 uint32_t Guest::rd32(gaddr a) const { return impl_->rd<uint32_t>(a); }
 void Guest::wr32(gaddr a, uint32_t v) { impl_->wr<uint32_t>(a, v); }

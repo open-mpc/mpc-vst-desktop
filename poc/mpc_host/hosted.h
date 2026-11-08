@@ -20,6 +20,7 @@ public:
         std::string root;                       // the plugin's "/" (MPC_HOST_ROOT); empty: the environment variable
         std::string support_dir;                // where guest_helpers*.so and guestlibs/ are; empty: next to the running program
         std::vector<std::string> libs;          // extra guest libraries to load first; empty: guestlibs/<arch>/ (or MPC_HOST_LIBS)
+        Guest::Hooks hooks;                     // services lent to the guest (HTTP, spawn); empty: none
     };
 
     HostedPlugin();

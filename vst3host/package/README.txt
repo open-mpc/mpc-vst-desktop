@@ -5,8 +5,8 @@ What this is
   A VST3 plugin for 64-bit Windows DAWs that runs Akai MPC / Force plugins (the ARM ".so" VST2 files built for the MPC and
   Force standalone devices) unchanged, by emulating the ARM processor. One VST3, "OpenMPC Host", hosts one MPC plugin at a time
   and you switch between them inside it. It starts with the OpenMPC Plugin Manager loaded and opens on the Manager tab, where
-  you can browse the OpenMPC catalog and install plugins, which then appear in the Plugin tab. (The Plugin Manager's own screen,
-  on the Skin tab, is built for installing on an MPC and says nothing can be installed here; use the Manager tab.)
+  you can browse the OpenMPC catalog and install plugins, which then appear in the Plugin tab. The Plugin Manager's own screen (Skin tab)
+  works too: it runs on a simulated MPC, so Discover, Install, Apply ("Restart MPC" only restarts the manager here) behave as on the device.
 
 Install
   1. Copy the folder "OpenMPC Host.vst3" to  C:\Program Files\Common Files\VST3\   (or any folder your DAW scans).
