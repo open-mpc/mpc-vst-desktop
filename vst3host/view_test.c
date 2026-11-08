@@ -66,14 +66,15 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-mgr4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
-    if (argc > 3 && !strcmp(argv[3], "q")) {   /* the Q-Link strip under the skin: 4 faders, drag one, 8 faders, then the Plugin tab */
+    if (argc > 3 && !strcmp(argv[3], "q")) {   /* the Q-Link strip: bank buttons, 8 mode, the plugin menu */
         pump(3000);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(150, 724)); SendMessage(v, WM_MOUSEMOVE, 0, MAKELPARAM(250, 724)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(250, 724)); pump(500);
         snprintf(p, sizeof p, "%s-q4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(40, 691)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(40, 691)); pump(1500);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(333, 712)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(333, 712)); pump(800);   /* bank 3 */
+        snprintf(p, sizeof p, "%s-qb3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(138, 712)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(138, 712)); pump(1200);   /* 8 */
         snprintf(p, sizeof p, "%s-q8.bmp", argv[2]); shot(v, p, r.right, r.bottom);
-        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(380, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(380, 20)); pump(1000);
-        snprintf(p, sizeof p, "%s-qp.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(350, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(350, 20)); pump(800);   /* the plugin list */
+        snprintf(p, sizeof p, "%s-qm.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
     if (argc > 3 && !strcmp(argv[3], "sw")) {   /* start on the manager's skin, then switch to the second plugin: its skin must not reuse the first one's pictures */
