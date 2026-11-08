@@ -14,6 +14,7 @@ static std::wstring W(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
+static const int kMinW = 960, kMinH = 560;   // the generic tabs; a plugin with a skin gets the skin's own size 1:1 (see want_size)
 enum HitKind { H_SKINPAGE, H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_PAGEPREV, H_PAGENEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
 struct Hit { RECT r; int kind, arg; };
 struct View {
@@ -23,6 +24,8 @@ struct View {
     std::vector<Hit> hits;
     std::mutex sm; std::string status = "Press Refresh to read the catalog.";
     std::vector<pm::Item> items; std::atomic<bool> busy{false};
+    int vw = kMinW, vh = kMinH;   // the window's size in pixels
+    std::shared_ptr<pm::Skin> csk; std::vector<float> cpv; std::vector<std::string> ctexts; int cpage_ = -1;   // the last snapshot of the skin page: drawn when the emulator is busy
     int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0; float sscale = 1;   // the skin tab: page, drag, scale
     std::map<std::string, Gdiplus::Bitmap*> bmps;
     ~View() { for (auto& kv : bmps) delete kv.second; }
@@ -37,7 +40,8 @@ static Gdiplus::Bitmap* skin_image(View* v, const std::string& dir, const std::s
     v->bmps[name] = b;
     return b;
 }
-static const int VW = 960, VH = 560;
+#define VW (v->vw)
+#define VH (v->vh)
 static void view_release(View* v) { if (--v->refs == 0) { Host* h = v->h; delete v; release(h); } }
 static void ui_edit(View* v, uint32_t id, double val, int phase) {   // phase 0 begin+set, 1 set, 2 set+end; the host hears it as an edit
     Host* h = v->h;
@@ -96,6 +100,17 @@ static void do_install(View* v) {
     }).detach();
 }
 
+// The window the hosted plugin's skin wants: its native pixels (a 1280x628 page) plus our header (44) and page tabs (42), never smaller than the generic tabs.
+static void want_size(Host* h, int& w, int& hh) {
+    w = kMinW; hh = kMinH;
+    if (h->skin) { w = std::max(kMinW, h->skin->w + 16); hh = std::max(kMinH, 44 + h->skin->h + 42); }
+}
+static void resize_view(View* v, int w, int h) {   // ask the host for a new window size (it calls onSize); the window follows at once
+    if (w == v->vw && h == v->vh) return;
+    v->vw = w; v->vh = h;
+    if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+    if (v->frame) { ViewRect r{0, 0, w, h}; ((PlugFrameVtbl* const*)v->frame)[0]->resizeView(v->frame, &v->vt, &r); }
+}
 static void paint(View* v, HDC dc, RECT cr) {
     HDC m = CreateCompatibleDC(dc);
     HBITMAP bmp = CreateCompatibleBitmap(dc, VW, VH);
@@ -124,9 +139,8 @@ static void paint(View* v, HDC dc, RECT cr) {
     Host* h = v->h;
     std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
     if (v->tab == 2) {
-        std::shared_ptr<pm::Skin> sk; std::vector<float> pv; std::vector<std::string> texts;
         if (lk.owns_lock()) {   // a snapshot, so the emulator is not held while drawing
-            sk = h->skin; pv = h->pv;
+            auto sk = h->skin; auto pv = h->pv; std::vector<std::string> texts;
             if (sk && v->spage >= (int)sk->pages.size()) v->spage = 0;
             if (sk) {   // the processor reads these back from the plugin, so buttons it resets itself show as off
                 std::vector<int> w;
@@ -140,8 +154,11 @@ static void paint(View* v, HDC dc, RECT cr) {
                 texts.push_back(t);
             }
             lk.unlock();
+            v->csk = sk; v->cpv = pv; v->ctexts = texts; v->cpage_ = v->spage;
         }
-        if (!sk) text(lk.owns_lock() || h->skin ? "This plugin has no skin." : "Loading the plugin...", RECT{16, 60, VW, 90}, dim);
+        std::shared_ptr<pm::Skin> sk = v->csk; std::vector<float> pv = v->cpv; std::vector<std::string> texts = v->ctexts;
+        if (sk && v->cpage_ != v->spage) sk = nullptr;   // the page changed since the snapshot: wait for a fresh one
+        if (!sk) text("No skin to show (the plugin has none, or it is still loading).", RECT{16, 60, VW, 90}, dim);
         else {
             int nt = (int)sk->pages.size(), tw = (VW - 32) / nt;
             for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, VH - 34, 16 + (i + 1) * tw - 4, VH - 8}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);   // the page tabs sit under the picture
@@ -331,7 +348,11 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(w, &ps); paint(v, dc, ps.rcPaint); EndPaint(w, &ps); return 0; }
         case WM_PRINTCLIENT: paint(v, (HDC)wp, RECT{0, 0, VW, VH}); return 0;
-        case WM_TIMER: InvalidateRect(w, nullptr, FALSE); return 0;
+        case WM_TIMER: {
+            int ww, hh;
+            { std::unique_lock<std::mutex> l(v->h->mu, std::try_to_lock); if (l.owns_lock()) { want_size(v->h, ww, hh); l.unlock(); resize_view(v, ww, hh); } }   // the plugin was switched: another skin, another size
+            InvalidateRect(w, nullptr, FALSE); return 0;
+        }
         case WM_LBUTTONDOWN: SetCapture(w); click(v, (short)LOWORD(lp), (short)HIWORD(lp)); InvalidateRect(w, nullptr, FALSE); return 0;
         case WM_MOUSEMOVE:
             if (v->sdrag >= 0) {
@@ -373,6 +394,7 @@ static tresult pv_attached(void* s, void* parent, const char* type) {
         WNDCLASSA wc{}; wc.lpfnWndProc = wndproc; wc.hInstance = GetModuleHandleA(nullptr); wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.lpszClassName = "OpenMPCHostView";
         RegisterClassA(&wc); reg = true;
     }
+    { std::unique_lock<std::mutex> l(v->h->mu, std::try_to_lock); if (l.owns_lock()) want_size(v->h, v->vw, v->vh); }
     v->wnd = CreateWindowExA(0, "OpenMPCHostView", "", WS_CHILD | WS_VISIBLE, 0, 0, VW, VH, (HWND)parent, nullptr, GetModuleHandleA(nullptr), nullptr);
     if (!v->wnd) return kResultFalse;
     SetWindowLongPtrA(v->wnd, GWLP_USERDATA, (LONG_PTR)v);
@@ -386,18 +408,19 @@ static tresult pv_removed(void* s) {
 }
 static tresult pv_nop(void*, float) { return kResultFalse; }
 static tresult pv_key(void*, char16, int16_t, int16_t) { return kResultFalse; }
-static tresult pv_size(void*, ViewRect* r) { r->left = r->top = 0; r->right = VW; r->bottom = VH; return kResultOk; }
-static tresult pv_onsize(void* s, ViewRect*) { View* v = (View*)((char*)s - offsetof(View, vt)); if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, VW, VH, SWP_NOMOVE | SWP_NOZORDER); return kResultOk; }
+static tresult pv_size(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); r->left = r->top = 0; r->right = VW; r->bottom = VH; return kResultOk; }
+static tresult pv_onsize(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); if (r && r->right - r->left > 0 && r->bottom - r->top > 0) { v->vw = r->right - r->left; v->vh = r->bottom - r->top; } if (v->wnd) SetWindowPos(v->wnd, nullptr, 0, 0, VW, VH, SWP_NOMOVE | SWP_NOZORDER); return kResultOk; }
 static tresult pv_focus(void*, uint8_t) { return kResultOk; }
 static tresult pv_frame(void* s, void* f) { View* v = (View*)((char*)s - offsetof(View, vt)); v->frame = f; return kResultOk; }
 static tresult pv_can_resize(void*) { return kResultFalse; }
-static tresult pv_check(void*, ViewRect* r) { r->right = r->left + VW; r->bottom = r->top + VH; return kResultOk; }
+static tresult pv_check(void* s, ViewRect* r) { View* v = (View*)((char*)s - offsetof(View, vt)); r->right = r->left + VW; r->bottom = r->top + VH; return kResultOk; }
 static const PlugViewVtbl pv_vtbl = {pv_query, pv_ref, pv_rel, pv_supported, pv_attached, pv_removed, pv_nop, pv_key, pv_key, pv_size, pv_onsize, pv_focus, pv_frame, pv_can_resize, pv_check};
 static void* create_view(Host* h) { View* v = new View(); v->vt = &pv_vtbl; v->h = h; h->refs++;
     bool mgr = false;
     {
         std::lock_guard<std::mutex> l(h->mu);
         if (h->skin) v->tab = 2;   // a plugin with a skin opens on it
+        want_size(h, v->vw, v->vh);
         mgr = h->cur >= 0 && h->entries[h->cur].name.find("Plugin Manager") != std::string::npos;
     }
     if (mgr) { v->tab = 1; do_refresh(v); }   // the stock manager cannot install on a desktop: open our own Manager tab, catalog loaded

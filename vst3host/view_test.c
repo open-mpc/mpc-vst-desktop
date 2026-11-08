@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     { void *pr = 0; c->v->queryInterface(c, iid_IAudioProcessor, &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
     struct { const PlugViewVtbl *v; } *view = ct->v->createView(ct, "editor");
     if (!view) { printf("no view\n"); return 1; }
-    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 1000, 640, 0, 0, 0, 0);
+    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 1340, 800, 0, 0, 0, 0);
     ViewRect r; view->v->getSize(view, &r);
     printf("view %dx%d\n", r.right, r.bottom);
     if (view->v->attached(view, w, "HWND") != kResultOk) { printf("attach failed\n"); return 1; }

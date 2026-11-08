@@ -105,6 +105,8 @@ Still to decide (see below): which hosts the curl shim may reach, and whether sw
 
 **Ableton Live (the owner's DAW):** `vst3host/package/install.bat` / `uninstall.bat` (system VST3 folder, asks for admin), README steps (Live 11/12, "Use VST3 System Folders", Rescan, Configure). Open points for Live, not testable here: window scaling on high-DPI screens (the editor is a fixed 960x560 in device pixels), how Live behaves with the 2000+ hidden MIDI-mapping parameters (JUCE plugins publish the same), scanning time while the manager loads.
 
+**Native skin size (2026-11-08, native Windows):** the editor window follows the hosted plugin's skin: skin pixels 1:1 (a 1280x628 page gives a 1296x714 window: 8 px margins, a 44 px header, a 42 px page-tab strip), never smaller than 960x560 for the generic tabs. On a plugin switch (a different skin size) the editor asks the host with `IPlugFrame::resizeView` and resizes its window; `onSize` is honoured. The skin tab draws from the last snapshot when the emulator is busy, so it no longer blanks while audio runs. Not done: scaling down for small screens or up for high DPI (`canResize` is false).
+
 **Not started:** M6 (Linux editor, CI).
 
 **Where M1 began (done):**
