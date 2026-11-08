@@ -28,6 +28,9 @@
 #endif
 #include <fstream>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <unordered_map>
 #include <cwctype>
@@ -100,7 +103,8 @@ struct Guest::Impl final : Dynarmic::A32::UserCallbacks, Dynarmic::A64::UserCall
     std::vector<std::string> stubs_called;   // unsupported imports the guest actually called (MPC_HOST_LAX only; otherwise the first one aborts)
     gaddr errno_p = 0, clocale = 0;
     // --- files: guest paths are mapped into MPC_HOST_ROOT (so /sdcard/x is $MPC_HOST_ROOT/sdcard/x); /plugin/ is the plugin's own directory ---
-    std::map<int, std::pair<std::vector<uint8_t>, size_t>> http;   // the lent HTTP GETs: body and read position
+    struct HttpJob { std::mutex mu; int state = 0; std::vector<uint8_t> body; std::string err; size_t from = 0; };
+    std::map<int, std::shared_ptr<HttpJob>> http;   // the lent HTTP GETs
     int next_http = 1, next_pid = 2000;
     std::map<int, int> exits;   // pid -> exit status of the lent spawns
     std::unordered_map<gaddr, FILE*> files;
@@ -898,21 +902,32 @@ std::vector<Entry> libc_table() {
     add("dlopen", [](I& i) { const std::string n = i.r(0) ? i.str(i.r(0)) : ""; i.ret(n.find("libcurl") != std::string::npos && i.g.hooks.http_get ? 1 : 0); });
     add("dlsym", [](I& i) { i.ret(i.r(0) == 1 && i.r(1) ? i.g.symbol(i.str(i.r(1))) : 0); });
     add("dlerror", [](I& i) { i.ret(0); });
-    add("__mpc_http_open", [](I& i) {   // (url, from): the whole body is fetched now; a handle, or -1
-        std::vector<uint8_t> body; std::string err;
-        if (!i.g.hooks.http_get || !i.g.hooks.http_get(i.str(i.r(0)), body, err)) { i.ret(0xFFFFFFFFu); return; }
+    // The fetch runs on a host thread so the emulator call that started it (an audio block, in a DAW) never waits for the network;
+    // the guest polls __mpc_http_state (0 pending, 1 ready, -1 failed, -22 the server answered with an error) and sleeps between polls.
+    add("__mpc_http_open", [](I& i) {   // (url, from) -> handle
+        if (!i.g.hooks.http_get) { i.ret(0xFFFFFFFFu); return; }
+        auto st = std::make_shared<I::HttpJob>();
+        st->from = i.r(1);
+        auto fn = i.g.hooks.http_get;
+        const std::string url = i.str(i.r(0));
+        std::thread([st, fn, url] {
+            std::vector<uint8_t> body; std::string err;
+            const bool ok = fn(url, body, err);
+            std::lock_guard<std::mutex> l(st->mu);
+            st->body = std::move(body); st->err = err; st->state = ok ? 1 : (err.compare(0, 4, "HTTP") == 0 ? -22 : -1);
+        }).detach();
         const int h = i.next_http++;
-        size_t from = i.r(1);
-        i.http[h] = {std::move(body), from};
+        i.http[h] = st;
         i.ret((uint32_t)h); });
-    add("__mpc_http_total", [](I& i) { auto it = i.http.find((int)i.r(0)); i.ret(it == i.http.end() ? 0 : (uint32_t)it->second.first.size()); });
+    add("__mpc_http_state", [](I& i) { auto it = i.http.find((int)i.r(0)); if (it == i.http.end()) { i.ret(0xFFFFFFFFu); return; } std::lock_guard<std::mutex> l(it->second->mu); i.ret((uint32_t)it->second->state); });
+    add("__mpc_http_total", [](I& i) { auto it = i.http.find((int)i.r(0)); i.ret(it == i.http.end() ? 0 : (uint32_t)it->second->body.size()); });
     add("__mpc_http_read", [](I& i) {   // (handle, buf, n) -> bytes
         auto it = i.http.find((int)i.r(0));
         if (it == i.http.end()) { i.ret(0); return; }
-        auto& b = it->second;
-        const size_t n = b.second >= b.first.size() ? 0 : std::min<size_t>(i.r(2), b.first.size() - b.second);
-        if (n) std::memcpy(i.m + i.r(1), b.first.data() + b.second, n);
-        b.second += n;
+        auto& b = *it->second;
+        const size_t n = b.from >= b.body.size() ? 0 : std::min<size_t>(i.r(2), b.body.size() - b.from);
+        if (n) std::memcpy(i.m + i.r(1), b.body.data() + b.from, n);
+        b.from += n;
         i.ret((uint32_t)n); });
     add("__mpc_http_close", [](I& i) { i.http.erase((int)i.r(0)); i.ret(0); });
     // posix_spawn(p): the argument vector goes to the embedding host's spawn hook, which runs it now; waitpid hands back the status

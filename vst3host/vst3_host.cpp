@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <thread>
 #include <mutex>
@@ -424,6 +425,8 @@ static void apply_param_change(Host* h, uint32_t id, double v) {   // mu held
 static tresult proc_process(void* s, ProcessData* d) {
     Host* h = FROM(s, proc);
     std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
+    // the editor holds the lock for a moment now and then: wait for it (a few ms at most) rather than drop the block; a plugin switch holds it for seconds: silence then
+    for (int t = 0; t < 40 && !lk.owns_lock() && !h->switching; t++) { std::this_thread::sleep_for(std::chrono::microseconds(250)); lk.try_lock(); }
     if (!lk.owns_lock() || !h->hp || !h->rs) {   // a plugin switch is loading: silence for now
         if (d->numOutputs > 0) for (int c = 0; c < d->outputs[0].numChannels; c++) memset(d->outputs[0].channelBuffers32[c], 0, d->numSamples * 4);
         return kResultOk;

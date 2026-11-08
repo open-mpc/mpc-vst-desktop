@@ -53,6 +53,8 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz, cmp_t cmp)
 typedef __SIZE_TYPE__ sz_t;
 extern int __mpc_http_open(const char *, long);
 extern long __mpc_http_total(int);
+extern int __mpc_http_state(int);
+extern int usleep(unsigned);
 extern long __mpc_http_read(int, void *, long);
 extern int __mpc_http_close(int);
 struct mpc_curl {
@@ -85,7 +87,13 @@ int curl_easy_setopt(void *h, int opt, ...) {
 int curl_easy_perform(void *h) {
     struct mpc_curl *c = h;
     int hd = __mpc_http_open(c->url, (long)c->from);
-    if (hd < 0) return 6;   /* CURLE_COULDNT_RESOLVE_HOST: whatever went wrong, the catalog is out of reach */
+    if (hd < 0) return 6;   /* CURLE_COULDNT_RESOLVE_HOST: no HTTP lent */
+    int st;
+    while ((st = __mpc_http_state(hd)) == 0) {   /* the host fetches on its own thread: wait, and let the manager's cancel run */
+        if (c->xf && c->xf(c->xd, 0, 0, 0, 0)) { __mpc_http_close(hd); return 42; }
+        usleep(30000);
+    }
+    if (st < 0) { __mpc_http_close(hd); return st == -22 ? 22 : 6; }   /* CURLE_HTTP_RETURNED_ERROR / could not connect */
     long total = __mpc_http_total(hd), done = 0, n;
     char *buf = malloc(16384);
     int rc = 0;
@@ -100,5 +108,5 @@ int curl_easy_perform(void *h) {
     return rc;
 }
 const char *curl_easy_strerror(int rc) {
-    return rc == 0 ? "No error" : rc == 6 ? "Could not resolve host" : rc == 23 ? "Failed writing received data" : rc == 42 ? "Operation was aborted by an application callback" : "Unknown error";
+    return rc == 0 ? "No error" : rc == 6 ? "Could not connect" : rc == 22 ? "The server answered with an error (HTTP 5xx or 4xx)" : rc == 23 ? "Failed writing received data" : rc == 42 ? "Operation was aborted by an application callback" : "Unknown error";
 }

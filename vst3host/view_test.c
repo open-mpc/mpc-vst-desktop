@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     { void *pr = 0; c->v->queryInterface(c, com(iid_IAudioProcessor), &pr); struct { const ProcessorVtbl *v; } *pp = pr; ProcessSetup ps = {0, 0, 512, 44100}; pp->v->setupProcessing(pp, &ps); c->v->setActive(c, 1); g_proc = pr; CreateThread(0, 0, audio_thread, 0, 0, 0); }
     struct { const PlugViewVtbl *v; } *view = ct->v->createView(ct, "editor");
     if (!view) { printf("no view\n"); return 1; }
-    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 1340, 800, 0, 0, 0, 0);
+    HWND w = CreateWindowA("STATIC", "host", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 0, 1340, 900, 0, 0, 0, 0);
     ViewRect r; view->v->getSize(view, &r);
     printf("view %dx%d\n", r.right, r.bottom);
     if (view->v->attached(view, w, "HWND") != kResultOk) { printf("attach failed\n"); return 1; }
@@ -64,6 +64,16 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s-mgr3.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(590, 412)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(590, 412)); pump(15000);   /* RESTART & APPLY in the prompt */
         snprintf(p, sizeof p, "%s-mgr4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        view->v->removed(view); printf("ok\n"); return 0;
+    }
+    if (argc > 3 && !strcmp(argv[3], "q")) {   /* the Q-Link strip under the skin: 4 faders, drag one, 8 faders, then the Plugin tab */
+        pump(3000);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(150, 724)); SendMessage(v, WM_MOUSEMOVE, 0, MAKELPARAM(250, 724)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(250, 724)); pump(500);
+        snprintf(p, sizeof p, "%s-q4.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(40, 691)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(40, 691)); pump(1500);
+        snprintf(p, sizeof p, "%s-q8.bmp", argv[2]); shot(v, p, r.right, r.bottom);
+        SendMessage(v, WM_LBUTTONDOWN, 0, MAKELPARAM(380, 20)); SendMessage(v, WM_LBUTTONUP, 0, MAKELPARAM(380, 20)); pump(1000);
+        snprintf(p, sizeof p, "%s-qp.bmp", argv[2]); shot(v, p, r.right, r.bottom);
         view->v->removed(view); printf("ok\n"); return 0;
     }
     if (argc > 3 && !strcmp(argv[3], "sw")) {   /* start on the manager's skin, then switch to the second plugin: its skin must not reuse the first one's pictures */

@@ -17,6 +17,9 @@ static std::wstring W(const std::string& s) {
 static const int kMinW = 960, kMinH = 560;   // the generic tabs; a plugin with a skin gets the skin's own size 1:1 (see want_size)
 enum HitKind { H_SKINPAGE, H_TAB, H_PLUGIN, H_MODE, H_BANKPREV, H_BANKNEXT, H_NEXT, H_PAGEPREV, H_PAGENEXT, H_KNOB, H_ITEM, H_REFRESH, H_INSTALL };
 struct Hit { RECT r; int kind, arg; };
+struct QSnap { int mode = 4, bank = 0, nbanks = 1, page = 0, npages = 0; std::string pagename; double val[8] = {}; bool act[8] = {}; std::string name[8], disp[8]; };
+struct TabSnap { bool ok = false; std::vector<std::string> names; int cur = -1; std::string pname, err; QSnap q; };   // what the generic tabs draw: taken under the emulator lock, drawn without it
+static const int kQStripH = 100;   // the Q-Link strip: a 26 px button row, then four or eight horizontal faders
 struct View {
     const PlugViewVtbl* vt; uint32_t refs = 1;
     Host* h; HWND wnd = nullptr; void* frame = nullptr;
@@ -24,6 +27,7 @@ struct View {
     std::vector<Hit> hits;
     std::mutex sm; std::string status = "Press Refresh to read the catalog.";
     std::vector<pm::Item> items; std::atomic<bool> busy{false};
+    TabSnap ts; std::map<int, std::string> ncache; int nc_cur = -2; std::string pname_s; RECT qtrack[8] = {};
     int vw = kMinW, vh = kMinH;   // the window's size in pixels
     std::shared_ptr<pm::Skin> csk; std::vector<float> cpv; std::vector<std::string> ctexts; int cpage_ = -1;   // the last snapshot of the skin page: drawn when the emulator is busy
     int spage = 0, sdrag = -1; double sdragy = 0, sdragv = 0; float sscale = 1;   // the skin tab: page, drag, scale
@@ -101,10 +105,35 @@ static void do_install(View* v) {
     }).detach();
 }
 
+static void take_snap(View* v, Host* h) {   // the emulator lock is held: a few calls, nothing drawn
+    TabSnap& S = v->ts;
+    S.ok = true;
+    S.names.clear();
+    for (auto& e : h->entries) S.names.push_back(e.name);
+    S.cur = h->cur;
+    if (v->nc_cur != h->cur) { v->ncache.clear(); v->pname_s.clear(); v->nc_cur = h->cur; }
+    if (h->hp && v->pname_s.empty()) v->pname_s = h->hp->name();
+    S.pname = h->hp ? v->pname_s : h->load_error;
+    S.err = h->hp && h->hp->dead() ? "The plugin stopped: " + h->hp->fault() + ". Switch away and back to restart it." : h->switch_error;
+    QSnap& q = S.q;
+    q.mode = h->qmode; q.bank = h->qbank; q.nbanks = nbanks(h); q.page = h->qpage; q.npages = (int)h->pages.size();
+    q.pagename = q.npages ? (h->pages[h->qpage % q.npages].name.empty() ? "Page " + std::to_string(h->qpage + 1) : h->pages[h->qpage % q.npages].name) : "";
+    for (int k = 0; k < 8; k++) {
+        q.val[k] = h->qval[k]; q.act[k] = false; q.name[k] = "-"; q.disp[k].clear();
+        if (k >= h->qmode) continue;
+        int p = qparam(h, k);
+        if (p < 0 || !h->hp) continue;
+        q.act[k] = true;
+        auto it = v->ncache.find(p);
+        if (it == v->ncache.end()) it = v->ncache.emplace(p, h->hp->param_name(p)).first;
+        q.name[k] = it->second;
+        q.disp[k] = h->hp->param_display(p);
+    }
+}
 // The window the hosted plugin's skin wants: its native pixels (a 1280x628 page) plus our header (44) and page tabs (42), never smaller than the generic tabs.
 static void want_size(Host* h, int& w, int& hh) {
     w = kMinW; hh = kMinH;
-    if (h->skin) { w = std::max(kMinW, h->skin->w + 16); hh = std::max(kMinH, 44 + h->skin->h + 42); }
+    if (h->skin) { w = std::max(kMinW, h->skin->w + 16); hh = std::max(kMinH, 44 + h->skin->h + kQStripH + 42); }
 }
 static void resize_view(View* v, int w, int h) {   // ask the host for a new window size (it calls onSize); the window follows at once
     if (w == v->vw && h == v->vh) return;
@@ -139,6 +168,37 @@ static void paint(View* v, HDC dc, RECT cr) {
 
     Host* h = v->h;
     std::unique_lock<std::mutex> lk(h->mu, std::try_to_lock);
+    if (lk.owns_lock() && v->tab != 1) take_snap(v, h);
+    const TabSnap& S = v->ts;
+    auto qstrip = [&](int x, int y, int w) {   // 4 or 8 horizontal faders in one row, with the mode / bank / page controls above
+        const QSnap& q = S.q;
+        int bx = x;
+        auto b = [&](int bw, const std::string& t, int kind) { button(RECT{bx, y, bx + bw, y + 26}, t, kind, 0); bx += bw + 6; };
+        b(84, q.mode == 4 ? "4 knobs" : "8 knobs", H_MODE);
+        b(30, "<", H_BANKPREV);
+        text("Bank " + std::to_string(q.bank + 1) + " / " + std::to_string(q.nbanks), RECT{bx, y, bx + 76, y + 26}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE); bx += 80;
+        b(30, ">", H_BANKNEXT);
+        b(100, "Next bank", H_NEXT);
+        if (q.npages > 0) {
+            bx += 14; b(30, "<", H_PAGEPREV);
+            text(q.pagename + "   (" + std::to_string(q.page + 1) + " / " + std::to_string(q.npages) + ")", RECT{bx, y, bx + 220, y + 26}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE); bx += 226;
+            b(30, ">", H_PAGENEXT);
+        }
+        const int n = q.mode, gap = 10, cw = (w - (n - 1) * gap) / n, fy = y + 34;
+        for (int k = 0; k < n; k++) {
+            const int cx = x + k * (cw + gap);
+            text(std::to_string(k + 1) + "  " + q.name[k], RECT{cx, fy, cx + cw, fy + 18}, q.act[k] ? fg : dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            RECT tr{cx, fy + 24, cx + cw, fy + 36};
+            box(tr, RGB(52, 56, 66));
+            const int fw = (int)((tr.right - tr.left) * std::min(1.0, std::max(0.0, q.val[k])));
+            box(RECT{tr.left, tr.top, tr.left + fw, tr.bottom}, q.act[k] ? acc : RGB(80, 85, 98));
+            const int tx = std::min((int)tr.right - 6, std::max((int)tr.left, (int)tr.left + fw - 3));
+            box(RECT{tx, tr.top - 3, tx + 6, tr.bottom + 3}, fg);
+            text(q.disp[k], RECT{cx, fy + 40, cx + cw, fy + 58}, dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            v->hits.push_back({RECT{cx, fy, cx + cw, fy + 58}, H_KNOB, k});
+            v->qtrack[k] = tr;
+        }
+    };
     if (v->tab == 2) {
         if (lk.owns_lock()) {   // a snapshot, so the emulator is not held while drawing
             auto sk = h->skin; auto pv = h->pv; std::vector<std::string> texts;
@@ -164,7 +224,7 @@ static void paint(View* v, HDC dc, RECT cr) {
             int nt = (int)sk->pages.size(), tw = (VW - 32) / nt;
             for (int i = 0; i < nt; i++) button(RECT{16 + i * tw, VH - 34, 16 + (i + 1) * tw - 4, VH - 8}, sk->pages[i].name, H_SKINPAGE, i, i == v->spage);   // the page tabs sit under the picture
             const int ox = 8, oy = 44;
-            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - 42) / (float)sk->h);
+            float s = std::min((VW - 2 * ox) / (float)sk->w, (VH - oy - kQStripH - 42) / (float)sk->h);
             v->sscale = s;
             auto val = [&](int p) { return p >= 0 && p < (int)pv.size() ? pv[p] : 0.0f; };
             auto opt = [&](int p, int n) { return n <= 1 ? (val(p) > 0.5f ? 1 : 0) : (int)lround(val(p) * (n - 1)); };
@@ -209,50 +269,22 @@ static void paint(View* v, HDC dc, RECT cr) {
                 }
             }
             g.Flush();
+            qstrip(ox, oy + (int)(sk->h * s) + 6, VW - 2 * ox);
         }
+        if (!sk && S.ok) qstrip(16, 100, VW - 32);
     } else if (v->tab == 0) {
-        if (!lk.owns_lock()) text("Loading the plugin...", RECT{16, 60, VW, 90}, dim);
+        if (lk.owns_lock()) lk.unlock();
+        if (!S.ok) text("Loading the plugin...", RECT{16, 60, VW, 90}, dim);
         else {
             text("PLUGINS", RECT{16, 48, 220, 68}, dim);
             int y = 70;
-            for (int i = 0; i < (int)h->entries.size() && y < VH - 30; i++, y += 26)
-                button(RECT{16, y, 230, y + 24}, h->entries[i].name, H_PLUGIN, i, i == h->cur);
+            for (int i = 0; i < (int)S.names.size() && y < VH - 30; i++, y += 26)
+                button(RECT{16, y, 230, y + 24}, S.names[i], H_PLUGIN, i, i == S.cur);
             RECT qp{250, 48, VW - 16, VH - 16}; box(qp, panel);
-            std::string pn = h->hp ? h->hp->name() : h->load_error;
-            text(pn.empty() ? "(unnamed)" : pn, RECT{262, 54, VW - 30, 66}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, fb);
-            if (h->hp && h->hp->dead()) text("The plugin stopped: " + h->hp->fault() + ". Switch away and back to restart it.", RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            else if (!h->switch_error.empty()) text(h->switch_error, RECT{262, 64, VW - 30, 86}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            text("Q-LINKS", RECT{262, 86, 400, 104}, dim);
-            button(RECT{262, 108, 342, 134}, h->qmode == 4 ? "4 knobs" : "8 knobs", H_MODE, 0);
-            button(RECT{352, 108, 382, 134}, "<", H_BANKPREV, 0);
-            text("Bank " + std::to_string(h->qbank + 1) + " / " + std::to_string(nbanks(h)), RECT{386, 108, 466, 134}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            button(RECT{470, 108, 500, 134}, ">", H_BANKNEXT, 0);
-            button(RECT{512, 108, 612, 134}, "Next bank", H_NEXT, 0);
-            if (!h->pages.empty()) {
-                button(RECT{262, 140, 292, 166}, "<", H_PAGEPREV, 0);
-                const pm::QPage& pg = h->pages[h->qpage % h->pages.size()];
-                text((pg.name.empty() ? "Page " + std::to_string(h->qpage + 1) : pg.name) + "   (" + std::to_string(h->qpage + 1) + " / " + std::to_string(h->pages.size()) + ")", RECT{296, 140, 520, 166}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                button(RECT{524, 140, 554, 166}, ">", H_PAGENEXT, 0);
-            }
-            int per = h->qmode == 8 ? 4 : 4, rows = h->qmode == 8 ? 2 : 1, kw = (VW - 16 - 250 - 24) / per;
-            for (int k = 0; k < h->qmode; k++) {
-                int cx = 262 + (k % per) * kw + kw / 2, cy = 222 + (k / per) * 108, r = 30;
-                RECT kr{cx - kw / 2 + 4, cy - 44, cx + kw / 2 - 4, cy + 62};
-                v->hits.push_back({kr, H_KNOB, k});
-                HPEN pen = CreatePen(PS_SOLID, 3, RGB(70, 75, 88)); HGDIOBJ op = SelectObject(m, pen); HGDIOBJ ob = SelectObject(m, GetStockObject(NULL_BRUSH));
-                Ellipse(m, cx - r, cy - r, cx + r, cy + r); SelectObject(m, op); DeleteObject(pen);
-                int p = qparam(h, k);
-                double val = h->qval[k];
-                double ang = (-225.0 + 270.0 * val) * 3.14159265 / 180.0;
-                HPEN ap = CreatePen(PS_SOLID, 4, p >= 0 ? acc : RGB(70, 75, 88)); op = SelectObject(m, ap);
-                MoveToEx(m, cx, cy, nullptr); LineTo(m, cx + (int)(cos(ang) * (r - 4)), cy - (int)(sin(ang) * (r - 4)));
-                SelectObject(m, op); DeleteObject(ap); SelectObject(m, ob);
-                std::string nm = p >= 0 && h->hp ? h->hp->param_name(p) : "-";
-                std::string ds = p >= 0 && h->hp ? h->hp->param_display(p) : "";
-                text(std::to_string(k + 1) + "  " + nm, RECT{kr.left, cy + r + 4, kr.right, cy + r + 24}, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                text(ds, RECT{kr.left, cy + r + 24, kr.right, cy + r + 42}, dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            }
-            (void)rows;
+            text(S.pname.empty() ? "(unnamed)" : S.pname, RECT{262, 54, VW - 30, 72}, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, fb);
+            if (!S.err.empty()) text(S.err, RECT{262, 74, VW - 30, 92}, RGB(255, 110, 100), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            text("Q-LINKS", RECT{262, 98, 400, 116}, dim);
+            qstrip(262, 120, VW - 16 - 12 - 262);
         }
     } else {
         if (lk.owns_lock()) lk.unlock();
@@ -301,6 +333,11 @@ static void skin_click(View* v, int x, int y) {   // a tap on the skin picture: 
         return;
     }
 }
+static double fader_val(View* v, int k, int x) {   // a horizontal fader: the pointer's place along its track
+    const RECT& t = v->qtrack[k];
+    double r = t.right > t.left ? (double)(x - t.left) / (t.right - t.left) : 0;
+    return r < 0 ? 0 : r > 1 ? 1 : r;
+}
 static void click(View* v, int x, int y) {
     Host* h = v->h;
     for (int i = (int)v->hits.size() - 1; i >= 0; i--) {
@@ -327,7 +364,7 @@ static void click(View* v, int x, int y) {
                 break;
             }
             case H_NEXT: ui_edit(v, kQNext, 1, 0); ui_edit(v, kQNext, 0, 2); break;
-            case H_KNOB: v->drag = ht.arg; v->dragy = y; v->dragv = h->qval[ht.arg]; if (h->handler) h->handler->v->beginEdit(h->handler, kQLink1 + ht.arg); break;
+            case H_KNOB: { v->drag = ht.arg; if (h->handler) h->handler->v->beginEdit(h->handler, kQLink1 + ht.arg); ui_edit(v, kQLink1 + ht.arg, fader_val(v, ht.arg, x), 1); break; }
             case H_ITEM: { std::lock_guard<std::mutex> l(v->sm); v->msel = ht.arg; break; }
             case H_REFRESH: do_refresh(v); break;
             case H_INSTALL: do_install(v); break;
@@ -361,8 +398,7 @@ static LRESULT wndproc2(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 ui_edit(v, kPluginBase + v->sdrag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
             }
             if (v->drag >= 0) {
-                double val = v->dragv + (v->dragy - (short)HIWORD(lp)) / 150.0;
-                ui_edit(v, kQLink1 + v->drag, val < 0 ? 0 : val > 1 ? 1 : val, 1);
+                ui_edit(v, kQLink1 + v->drag, fader_val(v, v->drag, (short)LOWORD(lp)), 1);
             }
             return 0;
         case WM_LBUTTONUP:

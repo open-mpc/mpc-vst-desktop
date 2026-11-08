@@ -12,6 +12,7 @@
 #include <winhttp.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 namespace pm {
@@ -303,7 +304,17 @@ bool http_get(const std::string& url, std::vector<uint8_t>& out, std::string& er
     out.clear();
     if (url.compare(0, 7, "file://") == 0) { if (!read_file(url.substr(7), out)) { err = "cannot read " + url; return false; } return true; }
     if (url.compare(0, 4, "http") != 0) { if (!read_file(url, out)) { err = "cannot read " + url; return false; } return true; }
-    return https_get(url, out, err);
+    for (int attempt = 0; attempt < 3; attempt++) {   // a busy server (503, 504) or a dropped connection: try again after a pause
+        out.clear();
+        if (https_get(url, out, err)) return true;
+        if (err.compare(0, 4, "HTTP") == 0 && err != "HTTP 502" && err != "HTTP 503" && err != "HTTP 504" && err != "HTTP 429") break;   // 404 etc.: no point
+#ifdef _WIN32
+        Sleep(2000 << attempt);
+#else
+        usleep(2000000u << attempt);
+#endif
+    }
+    return false;
 }
 
 bool load_catalog(const std::string& url, const std::string& arch, std::vector<Item>& items, std::string& err) {
